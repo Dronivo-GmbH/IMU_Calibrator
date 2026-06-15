@@ -189,7 +189,8 @@ def _draw_px4_block(ax, pose: str, *, compact: bool = False) -> None:
 
 
 class SixFaceWizard:
-    CAPTURE_SECONDS = 5.0
+    CAPTURE_TIMEOUT_SECONDS = 60.0
+    TARGET_SAMPLES = 500
 
     STATUS_PENDING = "#e5e7eb"
     STATUS_ACTIVE = "#3b82f6"
@@ -213,45 +214,54 @@ class SixFaceWizard:
         self._face_samples: list[list[dict]] = []
         self._face_done = [False] * 6
         self._capturing = False
+        self._fullscreen = False
         self._live_job: str | None = None
 
         self.win = tk.Toplevel(root)
         self.win.title("Six-Face Accelerometer Calibration")
-        self.win.geometry("960x720")
-        self.win.minsize(920, 680)
+        screen_w = self.win.winfo_screenwidth()
+        screen_h = self.win.winfo_screenheight()
+        self.win.geometry(f"{min(1120, screen_w - 80)}x{min(780, screen_h - 80)}")
+        self.win.minsize(900, 640)
         self.win.configure(bg="#ffffff")
         self.win.transient(root)
         self.win.grab_set()
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.win.bind("<F11>", lambda _event: self._toggle_fullscreen())
+        self.win.bind("<Escape>", lambda _event: self._exit_fullscreen())
 
         self._build_ui()
         self._show_face(0)
         self._start_live_update()
+        self.win.after(0, self._maximize_window)
 
     def _build_ui(self) -> None:
         # Header
         header = tk.Frame(self.win, bg="#ffffff")
-        header.pack(fill="x", padx=20, pady=(16, 8))
+        header.pack(fill="x", padx=16, pady=(10, 6))
 
-        tk.Label(header, text="Accelerometer Calibration", bg="#ffffff", fg=theme.TEXT,
-                 font=(theme.FONT, 16, "bold")).pack(anchor="w")
+        title_row = tk.Frame(header, bg="#ffffff")
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="Accelerometer Calibration", bg="#ffffff", fg=theme.TEXT,
+                 font=(theme.FONT, 16, "bold")).pack(side="left")
+        ttk.Button(title_row, text="Full screen", command=self._toggle_fullscreen).pack(side="right")
         self.subtitle_var = tk.StringVar()
         tk.Label(header, textvariable=self.subtitle_var, bg="#ffffff", fg=theme.MUTED,
-                 font=(theme.FONT, 11)).pack(anchor="w", pady=(4, 0))
+                 font=(theme.FONT, 10)).pack(anchor="w", pady=(2, 0))
 
         tk.Label(
             header,
             text="Hold the IMU in each orientation shown below, then capture. "
                  "Rotate through all 6 positions like PX4 sensor calibration.",
-            bg="#ffffff", fg=theme.MUTED, font=(theme.FONT, 10), wraplength=900, justify="left",
-        ).pack(anchor="w", pady=(8, 0))
+            bg="#ffffff", fg=theme.MUTED, font=(theme.FONT, 9), wraplength=920, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         # Overview grid — all 6 positions (PX4-style)
         overview = tk.LabelFrame(self.win, text="  All 6 positions  ", bg="#ffffff", fg=theme.TEXT,
-                                 font=(theme.FONT, 10, "bold"), padx=8, pady=8)
-        overview.pack(fill="x", padx=20, pady=(8, 4))
+                                 font=(theme.FONT, 10, "bold"), padx=6, pady=6)
+        overview.pack(fill="x", padx=16, pady=(4, 2))
 
-        self._overview_fig = Figure(figsize=(7.4, 2.5), dpi=80, facecolor="#ffffff")
+        self._overview_fig = Figure(figsize=(7.0, 2.0), dpi=80, facecolor="#ffffff")
         self._overview_axes = []
         for i, guide in enumerate(FACE_GUIDES):
             ax = self._overview_fig.add_subplot(2, 3, i + 1, projection="3d")
@@ -264,7 +274,7 @@ class SixFaceWizard:
 
         # Body: diagram + instructions
         body = tk.Frame(self.win, bg="#ffffff")
-        body.pack(fill="both", expand=True, padx=20, pady=8)
+        body.pack(fill="both", expand=True, padx=16, pady=6)
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
         body.rowconfigure(0, weight=1)
@@ -273,7 +283,7 @@ class SixFaceWizard:
                              font=(theme.FONT, 10, "bold"))
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-        self.main_fig = Figure(figsize=(5.8, 4.8), dpi=100, facecolor="#ffffff")
+        self.main_fig = Figure(figsize=(5.5, 4.0), dpi=100, facecolor="#ffffff")
         self.main_ax = self.main_fig.add_subplot(111, projection="3d")
         self.main_canvas = FigureCanvasTkAgg(self.main_fig, master=left)
         self.main_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
@@ -289,8 +299,8 @@ class SixFaceWizard:
         steps_frame.pack(fill="x", pady=(8, 10))
 
         self.steps_text = tk.Text(
-            steps_frame, height=9, wrap="word", font=(theme.FONT, 11),
-            bg="#ffffff", fg=theme.TEXT, relief="flat", padx=12, pady=10,
+            steps_frame, height=7, wrap="word", font=(theme.FONT, 10),
+            bg="#ffffff", fg=theme.TEXT, relief="flat", padx=10, pady=8,
             highlightthickness=0, spacing1=4, spacing3=6,
         )
         self.steps_text.pack(fill="both", expand=True)
@@ -299,7 +309,7 @@ class SixFaceWizard:
         self.hint_var = tk.StringVar()
         tk.Label(right, textvariable=self.hint_var, bg="#f0fdf4", fg="#166534",
                  font=(theme.FONT, 10), wraplength=320, justify="left",
-                 padx=10, pady=8).pack(fill="x", pady=(0, 10))
+                 padx=10, pady=6).pack(fill="x", pady=(0, 8))
 
         tk.Label(right, text="Live accelerometer", bg="#ffffff", fg=theme.MUTED,
                  font=(theme.FONT, 9)).pack(anchor="w")
@@ -314,7 +324,12 @@ class SixFaceWizard:
         self.progress_label = tk.StringVar()
         tk.Label(right, textvariable=self.progress_label, bg="#ffffff", fg=theme.TEXT,
                  font=(theme.FONT, 9)).pack(anchor="w")
-        self.progress = ttk.Progressbar(right, mode="determinate", maximum=100)
+        self.progress = ttk.Progressbar(
+            right,
+            mode="determinate",
+            maximum=100,
+            style="CalibrationIdle.Horizontal.TProgressbar",
+        )
         self.progress.pack(fill="x", pady=4)
 
         self.status_var = tk.StringVar(value="Align the board, verify live values, then capture.")
@@ -323,9 +338,11 @@ class SixFaceWizard:
 
         # Footer
         footer = tk.Frame(self.win, bg="#ffffff")
-        footer.pack(fill="x", padx=20, pady=(4, 18))
+        footer.pack(fill="x", padx=16, pady=(2, 10))
         ttk.Button(footer, text="Cancel", command=self._cancel).pack(side="left")
-        self.capture_btn = ttk.Button(footer, text="▶  Start capture (5 s)", command=self._start_capture)
+        self.capture_btn = ttk.Button(
+            footer, text="▶  Start capture (500 samples)", command=self._start_capture
+        )
         self.capture_btn.pack(side="right", padx=(8, 0))
         self.next_btn = ttk.Button(footer, text="Next position →", command=self._next_face, state="disabled")
         self.next_btn.pack(side="right")
@@ -364,10 +381,27 @@ class SixFaceWizard:
         self.main_canvas.draw()
 
         self.progress["value"] = 0
+        self.progress.config(style="CalibrationIdle.Horizontal.TProgressbar")
         self.progress_label.set("")
         self.capture_btn.config(state="normal")
         self.next_btn.config(state="disabled", text="Next position →")
         self.status_var.set("Position the board as shown. Check live values, then capture.")
+
+    def _maximize_window(self) -> None:
+        try:
+            self.win.state("zoomed")
+        except tk.TclError:
+            self.win.attributes("-zoomed", True)
+
+    def _toggle_fullscreen(self) -> None:
+        self._fullscreen = not self._fullscreen
+        self.win.attributes("-fullscreen", self._fullscreen)
+
+    def _exit_fullscreen(self) -> None:
+        if not self._fullscreen:
+            return
+        self._fullscreen = False
+        self.win.attributes("-fullscreen", False)
 
     def _start_live_update(self) -> None:
         self._update_live()
@@ -403,24 +437,29 @@ class SixFaceWizard:
         self._capturing = True
         self.capture_btn.config(state="disabled")
         self.next_btn.config(state="disabled")
+        self.progress.config(style="CalibrationRunning.Horizontal.TProgressbar")
         self.status_var.set("Hold completely still…")
         self.capture.start(
-            self.CAPTURE_SECONDS,
+            self.CAPTURE_TIMEOUT_SECONDS,
             on_tick=self._on_tick,
             on_complete=self._on_capture_done,
             on_error=self._on_capture_error,
+            target_samples=self.TARGET_SAMPLES,
         )
 
     def _on_tick(self, remaining_s: float, count: int) -> None:
-        self.progress["value"] = (1.0 - remaining_s / self.CAPTURE_SECONDS) * 100
-        self.progress_label.set(f"Capturing… {remaining_s:.1f}s remaining  ·  {count} samples")
+        self.progress["value"] = min(100, (count / self.TARGET_SAMPLES) * 100)
+        self.progress_label.set(
+            f"Capturing… {count} / {self.TARGET_SAMPLES} samples  ·  timeout {remaining_s:.1f}s"
+        )
 
     def _on_capture_done(self, samples: list[dict]) -> None:
         self._capturing = False
-        if len(samples) < 20:
+        if len(samples) < self.TARGET_SAMPLES:
             self.status_var.set("Too few samples — check USB connection and try again.")
             self.capture_btn.config(state="normal")
             self.progress["value"] = 0
+            self.progress.config(style="CalibrationIdle.Horizontal.TProgressbar")
             return
 
         self._face_samples.append(samples)
@@ -440,6 +479,7 @@ class SixFaceWizard:
         self._capturing = False
         self.status_var.set(msg)
         self.capture_btn.config(state="normal")
+        self.progress.config(style="CalibrationIdle.Horizontal.TProgressbar")
 
     def _next_face(self) -> None:
         if self._face_index >= 5:

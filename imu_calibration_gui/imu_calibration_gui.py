@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-import webbrowser
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -30,6 +30,11 @@ from sensor_units import StreamScale, normalize_sample, normalize_samples
 import viz_theme
 
 
+STATIC_CALIBRATION_SAMPLES = 500
+STATIC_CAPTURE_TIMEOUT_SECONDS = 60.0
+MAG_CAPTURE_SECONDS = 30.0
+
+
 class CalibrationCapture:
     """Non-blocking timed sample capture using tkinter after()."""
 
@@ -52,6 +57,7 @@ class CalibrationCapture:
         on_tick: callable,
         on_complete: callable,
         on_error: callable | None = None,
+        target_samples: int | None = None,
     ) -> None:
         self.cancel()
         self.active = True
@@ -67,7 +73,8 @@ class CalibrationCapture:
             sample_count = self.client.capture_count
             on_tick(remaining_s, sample_count)
 
-            if remaining_s <= 0:
+            target_reached = target_samples is not None and sample_count >= target_samples
+            if target_reached or remaining_s <= 0:
                 self.active = False
                 samples = self.client.stop_capture()
                 if not samples:
@@ -85,7 +92,7 @@ class CalibrationCapture:
 class BMI160CalibrationApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("BMI160 IMU Calibration Tool")
+        self.root.title("IMU Calibration Tool")
         self.root.geometry("1150x860")
         self.root.minsize(1050, 780)
 
@@ -100,6 +107,7 @@ class BMI160CalibrationApp:
         self._stream_scale = StreamScale()
         self._filter_config = FilterConfig(enabled=True, alpha=0.1)
         self._accel_filter = RuntimeEMAFilter(alpha=self._filter_config.alpha)
+        self.logo_image: object | None = None
 
         self._build_ui()
         self._on_filter_settings_changed()
@@ -127,32 +135,48 @@ class BMI160CalibrationApp:
         style.configure("Metric.TLabelframe", background=viz_theme.PANEL, relief="flat")
         style.configure("MetricValue.TLabel", font=(viz_theme.FONT, 13, "bold"), foreground=viz_theme.TEXT, background=viz_theme.PANEL)
         style.configure("MetricLabel.TLabel", font=(viz_theme.FONT, 9), foreground=viz_theme.MUTED, background=viz_theme.PANEL)
+        style.configure(
+            "CalibrationIdle.Horizontal.TProgressbar",
+            background=viz_theme.GRID,
+            troughcolor=viz_theme.GRID,
+            bordercolor=viz_theme.BORDER,
+            lightcolor=viz_theme.GRID,
+            darkcolor=viz_theme.BORDER,
+        )
+        style.configure(
+            "CalibrationRunning.Horizontal.TProgressbar",
+            background="#22c55e",
+            troughcolor=viz_theme.GRID,
+            bordercolor=viz_theme.BORDER,
+            lightcolor="#22c55e",
+            darkcolor="#16a34a",
+        )
 
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill="both", expand=True)
 
         header = ttk.Frame(main)
         header.pack(fill="x", pady=(0, 12))
-        ttk.Label(header, text="BMI160 IMU Calibration", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="IMU Calibration Tool", style="Title.TLabel").pack(side="left")
         ttk.Label(
             header,
             text="Real-time IMU streaming · Calibration · Device sync",
             foreground=viz_theme.MUTED,
         ).pack(side="left", padx=(12, 0))
 
-        dev_frame = ttk.Frame(header)
-        dev_frame.pack(side="right")
-        ttk.Label(dev_frame, text="Developer ", foreground=viz_theme.MUTED).pack(side="left")
-        dev_link = tk.Label(
-            dev_frame,
-            text="Apoorv Kulkarni",
-            fg=viz_theme.VECTOR,
-            bg=viz_theme.BG,
-            font=(viz_theme.FONT, 10),
-            cursor="hand2",
-        )
-        dev_link.pack(side="left")
-        dev_link.bind("<Button-1>", lambda _e: webbrowser.open("https://ak-apoorvkulkarni.github.io/"))
+        logo_path = Path(__file__).with_name("assets") / "dronivo_logo.png"
+        if logo_path.exists():
+            self.logo_image = self._load_logo_image(logo_path)
+            if self.logo_image:
+                tk.Label(
+                    header,
+                    image=self.logo_image,
+                    bg=viz_theme.BG,
+                    borderwidth=0,
+                    highlightthickness=0,
+                ).pack(side="right")
+            else:
+                ttk.Label(header, text="DRONIVO", font=(viz_theme.FONT, 13, "bold")).pack(side="right")
 
         self._build_connection_panel(main)
 
@@ -168,6 +192,44 @@ class BMI160CalibrationApp:
         self._build_live_view_tab(live_tab)
         self._build_calibration_tab(cal_tab)
         self._build_status_bar(main)
+
+    def _load_logo_image(self, logo_path: Path) -> object | None:
+        try:
+            from PIL import Image, ImageTk
+
+            image = Image.open(logo_path).convert("RGBA")
+            width, height = image.size
+            left, top, right, bottom = 0, 0, width, height
+
+            def mostly_dark_edge(box: tuple[int, int, int, int]) -> bool:
+                edge = image.crop(box)
+                pixels = list(edge.getdata())
+                dark_pixels = sum(
+                    1 for r, g, b, a in pixels
+                    if a > 0 and r < 40 and g < 40 and b < 40
+                )
+                return dark_pixels / max(1, len(pixels)) > 0.8
+
+            while top < bottom and mostly_dark_edge((left, top, right, top + 1)):
+                top += 1
+            while bottom > top and mostly_dark_edge((left, bottom - 1, right, bottom)):
+                bottom -= 1
+            while left < right and mostly_dark_edge((left, top, left + 1, bottom)):
+                left += 1
+            while right > left and mostly_dark_edge((right - 1, top, right, bottom)):
+                right -= 1
+
+            image = image.crop((left, top, right, bottom))
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            image.thumbnail((180, 64), resampling)
+            return ImageTk.PhotoImage(image)
+        except Exception:
+            pass
+
+        try:
+            return tk.PhotoImage(file=str(logo_path)).subsample(8, 8)
+        except tk.TclError:
+            return None
 
     def _build_connection_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Serial Connection", padding=12, style="Section.TLabelframe")
@@ -212,7 +274,7 @@ class BMI160CalibrationApp:
         self.filter_enabled = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             filter_row,
-            text="EMA on accel + gyro (not saved to JSON)",
+            text="EMA on accel + gyro",
             variable=self.filter_enabled,
             command=self._on_filter_settings_changed,
         ).pack(side="left", padx=(8, 12))
@@ -418,26 +480,28 @@ class BMI160CalibrationApp:
 
         instr = ttk.Label(
             frame,
-            text="Keep the device connected. Each workflow collects live samples with a countdown — do not click OK first.",
+            text="Keep the device connected. Each workflow collects live samples with a countdown.",
             wraplength=900,
         )
         instr.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
-        self.gyro_btn = ttk.Button(frame, text="1. Gyro — Keep Still (10s)", command=self._start_gyro_cal)
+        self.gyro_btn = ttk.Button(
+            frame, text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal
+        )
         self.gyro_btn.grid(row=1, column=0, padx=4, pady=4, sticky="ew")
 
         self.accel_flat_btn = ttk.Button(
-            frame, text="2a. Accel — Flat (+Z up, 10s)", command=self._start_accel_flat_cal
+            frame, text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal
         )
         self.accel_flat_btn.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
 
         self.accel_six_btn = ttk.Button(
-            frame, text="2b. Accel — Six-Face Wizard", command=self._start_accel_six_face
+            frame, text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face
         )
         self.accel_six_btn.grid(row=1, column=2, padx=4, pady=4, sticky="ew")
 
         self.mag_btn = ttk.Button(
-            frame, text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
+            frame, text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
         )
         self.mag_btn.grid(row=1, column=3, padx=4, pady=4, sticky="ew")
 
@@ -450,7 +514,12 @@ class BMI160CalibrationApp:
         self.progress_label = ttk.Label(progress_frame, text="Ready")
         self.progress_label.pack(anchor="w")
 
-        self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=100,
+            style="CalibrationIdle.Horizontal.TProgressbar",
+        )
         self.progress_bar.pack(fill="x", pady=4)
 
         self.capture_detail = ttk.Label(progress_frame, text="", foreground="#57606a")
@@ -464,14 +533,6 @@ class BMI160CalibrationApp:
 
         ttk.Button(action_frame, text="Export JSON…", command=self._export_calibration).pack(side="left", padx=4)
         ttk.Button(action_frame, text="Import JSON…", command=self._import_calibration).pack(side="left", padx=4)
-        self.write_device_btn = ttk.Button(
-            action_frame, text="Write to Device", command=self._write_calibration_to_device, state="disabled"
-        )
-        self.write_device_btn.pack(side="left", padx=4)
-        self.read_device_btn = ttk.Button(
-            action_frame, text="Read from Device", command=self._read_calibration_from_device, state="disabled"
-        )
-        self.read_device_btn.pack(side="left", padx=4)
         ttk.Button(action_frame, text="Reset Calibration", command=self._reset_calibration).pack(side="left", padx=4)
 
     def _build_status_bar(self, parent: ttk.Frame) -> None:
@@ -522,8 +583,6 @@ class BMI160CalibrationApp:
         self.conn_status.config(text=f"Connected · {port}", style="Status.Connected.TLabel")
         self.connect_btn.config(state="disabled")
         self.disconnect_btn.config(state="normal")
-        self.write_device_btn.config(state="normal")
-        self.read_device_btn.config(state="normal")
         self._stream_scale = StreamScale()
         self._accel_filter.reset()
         self.imu_visualizer.clear()
@@ -550,8 +609,6 @@ class BMI160CalibrationApp:
         self.conn_status.config(text="Disconnected", style="Status.Disconnected.TLabel")
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
-        self.write_device_btn.config(state="disabled")
-        self.read_device_btn.config(state="disabled")
         self.imu_visualizer.set_running(False)
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
@@ -672,6 +729,13 @@ class BMI160CalibrationApp:
         ):
             btn.config(state=state)
         self.cancel_btn.config(state="normal" if active else "disabled")
+        self.progress_bar.config(
+            style=(
+                "CalibrationRunning.Horizontal.TProgressbar"
+                if active
+                else "CalibrationIdle.Horizontal.TProgressbar"
+            )
+        )
         if not active:
             self.progress_bar["value"] = 0
             self.progress_label.config(text="Ready")
@@ -694,6 +758,7 @@ class BMI160CalibrationApp:
         instruction: str,
         min_samples: int,
         on_success: callable,
+        target_samples: int | None = None,
     ) -> None:
         if not self._ensure_connected():
             return
@@ -703,10 +768,14 @@ class BMI160CalibrationApp:
         self.status_var.set(instruction)
 
         def on_tick(remaining_s: float, sample_count: int) -> None:
-            elapsed_pct = (1.0 - remaining_s / duration_s) * 100
+            if target_samples:
+                elapsed_pct = min(100, (sample_count / target_samples) * 100)
+            else:
+                elapsed_pct = (1.0 - remaining_s / duration_s) * 100
             self.progress_bar["value"] = elapsed_pct
+            target_text = f" / {target_samples}" if target_samples else ""
             self.capture_detail.config(
-                text=f"Time left: {remaining_s:4.1f}s   ·   Samples: {sample_count}"
+                text=f"Time left: {remaining_s:4.1f}s   ·   Samples: {sample_count}{target_text}"
             )
 
         def on_complete(samples: list[dict]) -> None:
@@ -724,7 +793,7 @@ class BMI160CalibrationApp:
             self._set_capture_ui(active=False)
             messagebox.showerror("Capture Failed", msg)
 
-        self.capture.start(duration_s, on_tick, on_complete, on_error)
+        self.capture.start(duration_s, on_tick, on_complete, on_error, target_samples=target_samples)
 
     def _start_gyro_cal(self) -> None:
         def finish(samples: list[dict]) -> None:
@@ -743,10 +812,11 @@ class BMI160CalibrationApp:
             self.status_var.set("Gyro calibration saved.")
 
         self._run_timed_capture(
-            10.0,
-            "Gyro: keep the IMU completely still…",
-            min_samples=50,
+            STATIC_CAPTURE_TIMEOUT_SECONDS,
+            "Gyro: keep the IMU completely still until 500 samples are collected…",
+            min_samples=STATIC_CALIBRATION_SAMPLES,
             on_success=finish,
+            target_samples=STATIC_CALIBRATION_SAMPLES,
         )
 
     def _start_accel_flat_cal(self) -> None:
@@ -768,10 +838,11 @@ class BMI160CalibrationApp:
             self.status_var.set("Accelerometer (flat) calibration saved.")
 
         self._run_timed_capture(
-            10.0,
-            "Accel: place IMU flat with +Z pointing up, keep still…",
-            min_samples=50,
+            STATIC_CAPTURE_TIMEOUT_SECONDS,
+            "Accel: place IMU flat with +Z pointing up until 500 samples are collected…",
+            min_samples=STATIC_CALIBRATION_SAMPLES,
             on_success=finish,
+            target_samples=STATIC_CALIBRATION_SAMPLES,
         )
 
     def _start_accel_six_face(self) -> None:
@@ -845,7 +916,7 @@ class BMI160CalibrationApp:
             self.mag_plot.redraw()
 
         self._run_timed_capture(
-            30.0,
+            MAG_CAPTURE_SECONDS,
             "Mag: rotate IMU in smooth figure-8 patterns in all orientations…",
             min_samples=100,
             on_success=finish,
@@ -887,7 +958,7 @@ class BMI160CalibrationApp:
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
-            initialfile="bmi160_calibration.json",
+            initialfile="IMU_Calibration.json",
         )
         if not path:
             return
