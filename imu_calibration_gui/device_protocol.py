@@ -16,7 +16,7 @@ def format_set_cal_command(cal: CalibrationData) -> str:
 
 def parse_cal_response(line: str) -> tuple[str, dict[str, Any] | None]:
     line = line.strip()
-    if line in ("PONG", "CAL_OK", "CAL_ERR", "CAL_MODE_ON"):
+    if line in ("PONG", "CAL_OK", "CAL_ERR", "CAL_MODE_ON", "CAL_MODE_OFF"):
         return line, None
     if line.startswith("CAL "):
         try:
@@ -28,4 +28,4 @@ def parse_cal_response(line: str) -> tuple[str, dict[str, Any] | None]:
 
 def is_command_response(line: str) -> bool:
     line = line.strip()
-    return line in ("PONG", "CAL_OK", "CAL_ERR", "CAL_MODE_ON") or line.startswith("CAL ")
+    return line in ("PONG", "CAL_OK", "CAL_ERR", "CAL_MODE_ON", "CAL_MODE_OFF") or line.startswith("CAL ")

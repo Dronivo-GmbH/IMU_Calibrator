@@ -19,10 +19,11 @@
  *   Commands:
  *     PING
  *     CAL_MODE_ON
+ *     CAL_MODE_OFF
  *     GET_CAL
  *     SET_CAL {"gyro_offset":{...}, ...}
  *   Responses:
- *     PONG / CAL_MODE_ON / CAL_OK / CAL_ERR / CAL {...json...}
+ *     PONG / CAL_MODE_ON / CAL_MODE_OFF / CAL_OK / CAL_ERR / CAL {...json...}
  */
 
 #include <Wire.h>
@@ -290,6 +291,12 @@ void handleSerialCommand(String &line) {
     calibrationMode = true;
     lastSampleMs = 0;
     Serial.println("CAL_MODE_ON");
+    return;
+  }
+
+  if (line == "CAL_MODE_OFF") {
+    calibrationMode = false;
+    Serial.println("CAL_MODE_OFF");
     return;
   }
 

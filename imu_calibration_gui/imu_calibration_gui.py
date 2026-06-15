@@ -133,6 +133,10 @@ class BMI160CalibrationApp:
         style.configure("Section.TLabelframe.Label", font=(viz_theme.FONT, 11, "bold"), foreground=viz_theme.TEXT)
         style.configure("Status.Connected.TLabel", foreground="#16a34a")
         style.configure("Status.Disconnected.TLabel", foreground="#dc2626")
+        style.configure("CalibrationOn.TButton", foreground="#ffffff", background="#16a34a")
+        style.map("CalibrationOn.TButton", background=[("active", "#15803d"), ("disabled", "#86efac")])
+        style.configure("CalibrationOff.TButton", foreground="#ffffff", background="#dc2626")
+        style.map("CalibrationOff.TButton", background=[("active", "#b91c1c"), ("disabled", "#fca5a5")])
         style.configure("Metric.TLabelframe", background=viz_theme.PANEL, relief="flat")
         style.configure("MetricValue.TLabel", font=(viz_theme.FONT, 13, "bold"), foreground=viz_theme.TEXT, background=viz_theme.PANEL)
         style.configure("MetricLabel.TLabel", font=(viz_theme.FONT, 9), foreground=viz_theme.MUTED, background=viz_theme.PANEL)
@@ -257,7 +261,8 @@ class BMI160CalibrationApp:
         self.cal_mode_btn = ttk.Button(
             frame,
             text="Turn ON Calibration Mode",
-            command=self._turn_on_calibration_mode,
+            command=self._toggle_calibration_mode,
+            style="CalibrationOn.TButton",
             state="disabled",
         )
         self.cal_mode_btn.grid(row=1, column=5, padx=4)
@@ -592,9 +597,8 @@ class BMI160CalibrationApp:
         self.conn_status.config(text=f"Connected · {port}", style="Status.Connected.TLabel")
         self.connect_btn.config(state="disabled")
         self.disconnect_btn.config(state="normal")
-        self.cal_mode_btn.config(state="normal")
-        self.cal_mode_btn.config(text="Turn ON Calibration Mode")
         self._calibration_mode_on = False
+        self._refresh_calibration_mode_button()
         self._stream_scale = StreamScale()
         self._accel_filter.reset()
         self.imu_visualizer.clear()
@@ -621,8 +625,8 @@ class BMI160CalibrationApp:
         self.conn_status.config(text="Disconnected", style="Status.Disconnected.TLabel")
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
-        self.cal_mode_btn.config(text="Turn ON Calibration Mode", state="disabled")
         self._calibration_mode_on = False
+        self._refresh_calibration_mode_button()
         self.imu_visualizer.set_running(False)
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
@@ -744,7 +748,7 @@ class BMI160CalibrationApp:
             btn.config(state=state)
         if not active and self.client.is_connected:
             self.connect_btn.config(state="disabled")
-            self.cal_mode_btn.config(state="disabled" if self._calibration_mode_on else "normal")
+            self._refresh_calibration_mode_button()
         elif not active:
             self.cal_mode_btn.config(state="disabled")
         self.cancel_btn.config(state="normal" if active else "disabled")
@@ -760,17 +764,45 @@ class BMI160CalibrationApp:
             self.progress_label.config(text="Ready")
             self.capture_detail.config(text="")
 
-    def _turn_on_calibration_mode(self) -> None:
+    def _refresh_calibration_mode_button(self) -> None:
+        if not self.client.is_connected:
+            self.cal_mode_btn.config(
+                text="Turn ON Calibration Mode",
+                state="disabled",
+                style="CalibrationOn.TButton",
+            )
+            return
+
+        if self._calibration_mode_on:
+            self.cal_mode_btn.config(
+                text="Turn OFF Calibration Mode",
+                state="normal",
+                style="CalibrationOff.TButton",
+            )
+        else:
+            self.cal_mode_btn.config(
+                text="Turn ON Calibration Mode",
+                state="normal",
+                style="CalibrationOn.TButton",
+            )
+
+    def _toggle_calibration_mode(self) -> None:
         if not self._ensure_connected():
             return
 
-        self._calibration_mode_on = True
-        self.cal_mode_btn.config(text="Calibration Mode ON", state="disabled")
-        self.status_var.set("Arduino calibration mode command sent. IMU data should stream now.")
+        self._calibration_mode_on = not self._calibration_mode_on
+        command = "CAL_MODE_ON" if self._calibration_mode_on else "CAL_MODE_OFF"
+        status = (
+            "Arduino calibration mode command sent. IMU data should stream now."
+            if self._calibration_mode_on
+            else "Arduino calibration mode OFF command sent. IMU streaming should stop."
+        )
+        self._refresh_calibration_mode_button()
+        self.status_var.set(status)
 
         def worker() -> None:
             try:
-                self.client.write_command("CAL_MODE_ON")
+                self.client.write_command(command)
             except RuntimeError as exc:
                 self.root.after(0, lambda: self.status_var.set(f"Calibration mode command failed: {exc}"))
 
