@@ -14,6 +14,8 @@ import serial.tools.list_ports
 
 from device_protocol import is_command_response
 
+GRAVITY = 9.80665
+
 
 @dataclass
 class IMUSample:
@@ -41,7 +43,12 @@ def parse_line(line: str) -> dict[str, float] | None:
     Supported serial formats:
       DFRobot / ESP32:  ax,ay,az,gx,gy,gz          (6 values, raw LSB)
       9-axis stream:    ax,ay,az,gx,gy,gz,mx,my,mz  (9 values)
+      BNO055 plotter:   ax_g:... ay_g:... az_g:... gx_dps:... gy_dps:... gz_dps:... mx_uT:... my_uT:... mz_uT:...
     """
+    plotter_sample = _parse_bno055_plotter_line(line)
+    if plotter_sample:
+        return plotter_sample
+
     try:
         parts = [p.strip() for p in line.split(",")]
         values = [float(p) for p in parts if p]
@@ -60,6 +67,37 @@ def parse_line(line: str) -> dict[str, float] | None:
         return None
     except ValueError:
         return None
+
+
+def _parse_bno055_plotter_line(line: str) -> dict[str, float] | None:
+    if ":" not in line:
+        return None
+
+    values: dict[str, float] = {}
+    for token in line.replace("\t", " ").split():
+        if ":" not in token:
+            continue
+        key, raw_value = token.split(":", 1)
+        try:
+            values[key.strip()] = float(raw_value.strip())
+        except ValueError:
+            return None
+
+    required = ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "mx_uT", "my_uT", "mz_uT")
+    if not all(key in values for key in required):
+        return None
+
+    return {
+        "ax": values["ax_g"] * GRAVITY,
+        "ay": values["ay_g"] * GRAVITY,
+        "az": values["az_g"] * GRAVITY,
+        "gx": values["gx_dps"],
+        "gy": values["gy_dps"],
+        "gz": values["gz_dps"],
+        "mx": values["mx_uT"],
+        "my": values["my_uT"],
+        "mz": values["mz_uT"],
+    }
 
 
 def list_serial_ports() -> list[str]:
