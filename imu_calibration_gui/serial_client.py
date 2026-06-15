@@ -174,6 +174,14 @@ class SerialIMUClient:
                 continue
         return None
 
+    def write_command(self, command: str) -> None:
+        if not self.is_connected or not self._ser:
+            raise RuntimeError("Serial port is not connected")
+
+        with self._write_lock:
+            self._ser.write(f"{command.strip()}\n".encode("utf-8"))
+            self._ser.flush()
+
     def ping_device(self) -> bool:
         try:
             return self.send_command("PING") == "PONG"

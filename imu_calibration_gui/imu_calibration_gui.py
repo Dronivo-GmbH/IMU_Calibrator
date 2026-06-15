@@ -102,6 +102,7 @@ class BMI160CalibrationApp:
         self.capture = CalibrationCapture(root, self.client)
 
         self._ui_disabled = False
+        self._calibration_mode_on = False
         self._plot_sample_counter = 0
         self._port_scan_running = False
         self._stream_scale = StreamScale()
@@ -253,22 +254,30 @@ class BMI160CalibrationApp:
         self.disconnect_btn = ttk.Button(frame, text="Disconnect", command=self._disconnect, state="disabled")
         self.disconnect_btn.grid(row=1, column=4, padx=4)
 
+        self.cal_mode_btn = ttk.Button(
+            frame,
+            text="Turn ON Calibration Mode",
+            command=self._turn_on_calibration_mode,
+            state="disabled",
+        )
+        self.cal_mode_btn.grid(row=1, column=5, padx=4)
+
         self.conn_status = ttk.Label(frame, text="Disconnected", style="Status.Disconnected.TLabel")
-        self.conn_status.grid(row=1, column=5, padx=(16, 0))
+        self.conn_status.grid(row=1, column=6, padx=(16, 0))
 
         ttk.Label(
             frame,
             text="CSV formats: ax,ay,az,gx,gy,gz  (DFRobot ESP32)  or  +mx,my,mz for 9-axis",
             foreground="#57606a",
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=7, sticky="w", pady=(8, 0))
 
         self.stream_mode_var = tk.StringVar(value="Stream: —")
         ttk.Label(frame, textvariable=self.stream_mode_var, foreground="#57606a").grid(
-            row=2, column=5, sticky="e", pady=(8, 0)
+            row=2, column=6, sticky="e", pady=(8, 0)
         )
 
         filter_row = ttk.Frame(frame)
-        filter_row.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        filter_row.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(8, 0))
 
         ttk.Label(filter_row, text="Runtime filter:", font=(viz_theme.FONT, 9, "bold")).pack(side="left")
         self.filter_enabled = tk.BooleanVar(value=True)
@@ -583,6 +592,9 @@ class BMI160CalibrationApp:
         self.conn_status.config(text=f"Connected · {port}", style="Status.Connected.TLabel")
         self.connect_btn.config(state="disabled")
         self.disconnect_btn.config(state="normal")
+        self.cal_mode_btn.config(state="normal")
+        self.cal_mode_btn.config(text="Turn ON Calibration Mode")
+        self._calibration_mode_on = False
         self._stream_scale = StreamScale()
         self._accel_filter.reset()
         self.imu_visualizer.clear()
@@ -609,6 +621,8 @@ class BMI160CalibrationApp:
         self.conn_status.config(text="Disconnected", style="Status.Disconnected.TLabel")
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
+        self.cal_mode_btn.config(text="Turn ON Calibration Mode", state="disabled")
+        self._calibration_mode_on = False
         self.imu_visualizer.set_running(False)
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
@@ -725,9 +739,14 @@ class BMI160CalibrationApp:
         state = "disabled" if active else "normal"
         for btn in (
             self.gyro_btn, self.accel_flat_btn, self.accel_six_btn,
-            self.mag_btn, self.connect_btn, self.refresh_btn,
+            self.mag_btn, self.connect_btn, self.refresh_btn, self.cal_mode_btn,
         ):
             btn.config(state=state)
+        if not active and self.client.is_connected:
+            self.connect_btn.config(state="disabled")
+            self.cal_mode_btn.config(state="disabled" if self._calibration_mode_on else "normal")
+        elif not active:
+            self.cal_mode_btn.config(state="disabled")
         self.cancel_btn.config(state="normal" if active else "disabled")
         self.progress_bar.config(
             style=(
@@ -741,6 +760,22 @@ class BMI160CalibrationApp:
             self.progress_label.config(text="Ready")
             self.capture_detail.config(text="")
 
+    def _turn_on_calibration_mode(self) -> None:
+        if not self._ensure_connected():
+            return
+
+        self._calibration_mode_on = True
+        self.cal_mode_btn.config(text="Calibration Mode ON", state="disabled")
+        self.status_var.set("Arduino calibration mode command sent. IMU data should stream now.")
+
+        def worker() -> None:
+            try:
+                self.client.write_command("CAL_MODE_ON")
+            except RuntimeError as exc:
+                self.root.after(0, lambda: self.status_var.set(f"Calibration mode command failed: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _cancel_capture(self) -> None:
         self.capture.cancel()
         self._set_capture_ui(active=False)
@@ -752,6 +787,17 @@ class BMI160CalibrationApp:
             return False
         return True
 
+    def _ensure_calibration_mode(self) -> bool:
+        if not self._ensure_connected():
+            return False
+        if not self._calibration_mode_on:
+            messagebox.showerror(
+                "Calibration Mode",
+                "Click Turn ON Calibration Mode before starting calibration.",
+            )
+            return False
+        return True
+
     def _run_timed_capture(
         self,
         duration_s: float,
@@ -760,7 +806,7 @@ class BMI160CalibrationApp:
         on_success: callable,
         target_samples: int | None = None,
     ) -> None:
-        if not self._ensure_connected():
+        if not self._ensure_calibration_mode():
             return
 
         self._set_capture_ui(active=True)
@@ -846,7 +892,7 @@ class BMI160CalibrationApp:
         )
 
     def _start_accel_six_face(self) -> None:
-        if not self._ensure_connected():
+        if not self._ensure_calibration_mode():
             return
 
         self._set_capture_ui(active=True)

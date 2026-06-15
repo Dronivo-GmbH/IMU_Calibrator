@@ -18,10 +18,11 @@
  *   Stream:  ax,ay,az,gx,gy,gz,mx,my,mz
  *   Commands:
  *     PING
+ *     CAL_MODE_ON
  *     GET_CAL
  *     SET_CAL {"gyro_offset":{...}, ...}
  *   Responses:
- *     PONG / CAL_OK / CAL_ERR / CAL {...json...}
+ *     PONG / CAL_MODE_ON / CAL_OK / CAL_ERR / CAL {...json...}
  */
 
 #include <Wire.h>
@@ -51,6 +52,7 @@ static const uint32_t CAL_MAGIC = 0xCA1B1601;
 SparkFunBMI160 imu;
 SparkFunBMM150Aux mag;
 bool magReady = false;
+bool calibrationMode = false;
 
 // ---------- Calibration ----------
 struct CalProfile {
@@ -284,6 +286,13 @@ void handleSerialCommand(String &line) {
     return;
   }
 
+  if (line == "CAL_MODE_ON") {
+    calibrationMode = true;
+    lastSampleMs = 0;
+    Serial.println("CAL_MODE_ON");
+    return;
+  }
+
   if (line == "GET_CAL") {
     emitCalibrationJson();
     return;
@@ -327,7 +336,7 @@ void setup() {
   }
 
   loadCalibration();
-  Serial.println("# READY BMI160 streamer");
+  Serial.println("# READY BMI160 streamer idle; send CAL_MODE_ON to stream");
 }
 
 void loop() {
@@ -337,7 +346,7 @@ void loop() {
   }
 
   uint32_t now = millis();
-  if (now - lastSampleMs >= SAMPLE_MS) {
+  if (calibrationMode && now - lastSampleMs >= SAMPLE_MS) {
     lastSampleMs = now;
     streamSample();
   }
