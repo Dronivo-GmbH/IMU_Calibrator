@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -20,7 +21,7 @@ from calibration import (
     calibrate_mag_hard_iron,
     mag_quality_metrics,
 )
-from device_protocol import format_set_cal_command, parse_cal_response
+from device_protocol import format_bno_write_profile_command, format_set_cal_command, parse_cal_response
 from filtering import EMA_PRESETS, FilterConfig, RuntimeEMAFilter, apply_runtime_filter
 from six_face_wizard import open_six_face_wizard
 from imu_visualizer import IMUVisualizerWidget
@@ -33,6 +34,8 @@ import viz_theme
 STATIC_CALIBRATION_SAMPLES = 500
 STATIC_CAPTURE_TIMEOUT_SECONDS = 60.0
 MAG_CAPTURE_SECONDS = 30.0
+IMU_MODEL_BMI160 = "BMI160 / compatible"
+IMU_MODEL_BNO055 = "BNO055"
 
 
 class CalibrationCapture:
@@ -109,13 +112,18 @@ class BMI160CalibrationApp:
         self._filter_config = FilterConfig(enabled=True, alpha=0.1)
         self._accel_filter = RuntimeEMAFilter(alpha=self._filter_config.alpha)
         self.logo_image: object | None = None
+        self._bno_profile: dict | None = None
+        self._bno_status: dict | None = None
+        self._bno_monitor_active = False
 
         self._build_ui()
+        self._refresh_imu_model_ui()
         self._on_filter_settings_changed()
         self._refresh_ports()
         self._update_mag_ui_visibility()
         self._update_display_loop()
         self._refresh_cal_table()
+        self._show_window()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -236,6 +244,23 @@ class BMI160CalibrationApp:
         except tk.TclError:
             return None
 
+    def _show_window(self) -> None:
+        self.root.update_idletasks()
+
+        width = self.root.winfo_width() or 1150
+        height = self.root.winfo_height() or 860
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2)
+
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.root.attributes("-topmost", True)
+        self.root.after(300, lambda: self.root.attributes("-topmost", False))
+
     def _build_connection_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Serial Connection", padding=12, style="Section.TLabelframe")
         frame.pack(fill="x", pady=(0, 10))
@@ -249,14 +274,26 @@ class BMI160CalibrationApp:
         self.baud_entry.insert(0, "115200")
         self.baud_entry.grid(row=1, column=1, padx=(0, 8), pady=4, sticky="w")
 
+        ttk.Label(frame, text="IMU model").grid(row=0, column=2, sticky="w")
+        self.imu_model_var = tk.StringVar(value=IMU_MODEL_BMI160)
+        self.imu_model_combo = ttk.Combobox(
+            frame,
+            textvariable=self.imu_model_var,
+            values=[IMU_MODEL_BMI160, IMU_MODEL_BNO055],
+            width=20,
+            state="readonly",
+        )
+        self.imu_model_combo.grid(row=1, column=2, padx=(0, 8), pady=4, sticky="w")
+        self.imu_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_imu_model_changed())
+
         self.refresh_btn = ttk.Button(frame, text="Refresh", command=self._refresh_ports)
-        self.refresh_btn.grid(row=1, column=2, padx=4)
+        self.refresh_btn.grid(row=1, column=3, padx=4)
 
         self.connect_btn = ttk.Button(frame, text="Connect", command=self._connect)
-        self.connect_btn.grid(row=1, column=3, padx=4)
+        self.connect_btn.grid(row=1, column=4, padx=4)
 
         self.disconnect_btn = ttk.Button(frame, text="Disconnect", command=self._disconnect, state="disabled")
-        self.disconnect_btn.grid(row=1, column=4, padx=4)
+        self.disconnect_btn.grid(row=1, column=5, padx=4)
 
         self.cal_mode_btn = ttk.Button(
             frame,
@@ -265,10 +302,10 @@ class BMI160CalibrationApp:
             style="CalibrationOn.TButton",
             state="disabled",
         )
-        self.cal_mode_btn.grid(row=1, column=5, padx=4)
+        self.cal_mode_btn.grid(row=1, column=6, padx=4)
 
         self.conn_status = ttk.Label(frame, text="Disconnected", style="Status.Disconnected.TLabel")
-        self.conn_status.grid(row=1, column=6, padx=(16, 0))
+        self.conn_status.grid(row=1, column=7, padx=(16, 0))
 
         ttk.Label(
             frame,
@@ -278,7 +315,7 @@ class BMI160CalibrationApp:
 
         self.stream_mode_var = tk.StringVar(value="Stream: —")
         ttk.Label(frame, textvariable=self.stream_mode_var, foreground="#57606a").grid(
-            row=2, column=6, sticky="e", pady=(8, 0)
+            row=2, column=7, sticky="e", pady=(8, 0)
         )
 
         filter_row = ttk.Frame(frame)
@@ -498,6 +535,7 @@ class BMI160CalibrationApp:
             wraplength=900,
         )
         instr.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self.calibration_instr = instr
 
         self.gyro_btn = ttk.Button(
             frame, text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal
@@ -518,6 +556,11 @@ class BMI160CalibrationApp:
             frame, text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
         )
         self.mag_btn.grid(row=1, column=3, padx=4, pady=4, sticky="ew")
+
+        self.model_workflow_note = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.model_workflow_note, foreground=viz_theme.MUTED, wraplength=900).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(8, 0)
+        )
 
         for col in range(4):
             frame.columnconfigure(col, weight=1)
@@ -552,6 +595,59 @@ class BMI160CalibrationApp:
     def _build_status_bar(self, parent: ttk.Frame) -> None:
         self.status_var = tk.StringVar(value="Connect your BMI160 board and start a calibration workflow.")
         ttk.Label(parent, textvariable=self.status_var, relief="sunken", padding=6).pack(fill="x")
+
+    def _on_imu_model_changed(self) -> None:
+        self._refresh_imu_model_ui()
+
+    def _is_bno055_mode(self) -> bool:
+        return self.imu_model_var.get() == IMU_MODEL_BNO055
+
+    def _refresh_imu_model_ui(self) -> None:
+        if self._is_bno055_mode():
+            self.calibration_instr.config(
+                text=(
+                    "BNO055 uses Bosch internal fusion calibration. Keep the device still for gyro, "
+                    "move through 6 stable orientations for accel, and rotate through random 3D / "
+                    "figure-eight motion for mag until SYS/GYR/ACC/MAG all reach 3."
+                )
+            )
+            self.gyro_btn.config(text="1. BNO055 — Initialize / NDOF", command=self._bno_begin)
+            self.accel_flat_btn.config(text="2. BNO055 — Monitor calibration status", command=self._bno_monitor_calibration)
+            self.accel_six_btn.config(text="3. BNO055 — Read & save device profile", command=self._bno_read_profile_from_device)
+            self.mag_btn.config(text="4. BNO055 — Write loaded profile to device", command=self._bno_write_profile_to_device)
+            self.model_workflow_note.set(
+                "Use the new firmware sketch at firmware/bno055_serial_cal/ for Nano/ESP32. "
+                "The GUI will initialize BNO055, poll SYS/GYR/ACC/MAG status, and read/write the "
+                "22-byte calibration profile over serial."
+            )
+            if not self.client.is_connected:
+                self.status_var.set("Connect your BNO055-over-serial board and click Initialize / NDOF first.")
+        else:
+            self.calibration_instr.config(
+                text="Keep the device connected. Each workflow collects live samples with a countdown."
+            )
+            self.gyro_btn.config(text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal)
+            self.accel_flat_btn.config(text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal)
+            self.accel_six_btn.config(text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face)
+            self.mag_btn.config(text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
+            self.model_workflow_note.set("")
+            if not self.client.is_connected:
+                self.status_var.set("Connect your BMI160 board and start a calibration workflow.")
+        self._apply_mode_button_states()
+
+    def _apply_mode_button_states(self) -> None:
+        base_state = "disabled" if self._ui_disabled else "normal"
+        if self._is_bno055_mode():
+            if not self.client.is_connected:
+                base_state = "disabled"
+            for btn in (self.gyro_btn, self.accel_flat_btn, self.accel_six_btn, self.mag_btn):
+                btn.config(state=base_state)
+            return
+
+        self.gyro_btn.config(state=base_state)
+        self.accel_flat_btn.config(state=base_state)
+        self.accel_six_btn.config(state=base_state)
+        self.mag_btn.config(state="normal" if self.client.has_magnetometer and not self._ui_disabled else "disabled")
 
     def _refresh_ports(self) -> None:
         if self._port_scan_running:
@@ -599,6 +695,7 @@ class BMI160CalibrationApp:
         self.disconnect_btn.config(state="normal")
         self._calibration_mode_on = False
         self._refresh_calibration_mode_button()
+        self._apply_mode_button_states()
         self._stream_scale = StreamScale()
         self._accel_filter.reset()
         self.imu_visualizer.clear()
@@ -627,6 +724,7 @@ class BMI160CalibrationApp:
         self.disconnect_btn.config(state="disabled")
         self._calibration_mode_on = False
         self._refresh_calibration_mode_button()
+        self._apply_mode_button_states()
         self.imu_visualizer.set_running(False)
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
@@ -687,8 +785,9 @@ class BMI160CalibrationApp:
 
     def _update_mag_ui_visibility(self) -> None:
         has_mag = self.client.has_magnetometer
-        state = "normal" if has_mag else "disabled"
-        self.mag_btn.config(state=state)
+        if not self._is_bno055_mode():
+            state = "normal" if has_mag and not self._ui_disabled else "disabled"
+            self.mag_btn.config(state=state)
         if has_mag:
             self._mag_plot_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         else:
@@ -742,10 +841,10 @@ class BMI160CalibrationApp:
         self._ui_disabled = active
         state = "disabled" if active else "normal"
         for btn in (
-            self.gyro_btn, self.accel_flat_btn, self.accel_six_btn,
-            self.mag_btn, self.connect_btn, self.refresh_btn, self.cal_mode_btn,
+            self.connect_btn, self.refresh_btn, self.cal_mode_btn,
         ):
             btn.config(state=state)
+        self._apply_mode_button_states()
         if not active and self.client.is_connected:
             self.connect_btn.config(state="disabled")
             self._refresh_calibration_mode_button()
@@ -808,20 +907,179 @@ class BMI160CalibrationApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _bno_begin(self) -> None:
+        if not self._ensure_connected():
+            return
+        self.status_var.set("Initializing BNO055 and entering NDOF mode…")
+
+        def worker() -> None:
+            try:
+                response = self.client.send_command("BNO_BEGIN", timeout=5.0)
+            except RuntimeError as exc:
+                self.root.after(0, lambda: messagebox.showerror("BNO055 Init Failed", str(exc)))
+                return
+            self.root.after(0, lambda: self._on_bno_begin_response(response))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bno_begin_response(self, response: str | None) -> None:
+        kind, payload = parse_cal_response(response or "")
+        if kind == "BNO_BEGIN" and payload:
+            address = payload.get("address", 0)
+            self.status_var.set(f"BNO055 initialized at 0x{int(address):02X} in NDOF mode.")
+            messagebox.showinfo(
+                "BNO055 Ready",
+                "BNO055 initialized successfully.\n\n"
+                "Next:\n"
+                "1. Keep the device still for gyro calibration.\n"
+                "2. Move through 6 stable orientations for accelerometer calibration.\n"
+                "3. Move in figure-eight / random 3D motion for magnetometer calibration.",
+            )
+            return
+        if kind == "BNO_ERR" and payload:
+            messagebox.showerror("BNO055 Init Failed", str(payload.get("message", "Unknown BNO055 error")))
+            self.status_var.set("BNO055 initialization failed.")
+            return
+        messagebox.showerror("BNO055 Init Failed", f"Unexpected response: {response or 'timeout'}")
+        self.status_var.set("BNO055 initialization failed.")
+
+    def _bno_monitor_calibration(self) -> None:
+        if not self._ensure_connected():
+            return
+        if self._bno_monitor_active:
+            return
+        self._bno_monitor_active = True
+        self._set_capture_ui(active=True)
+        self.progress_label.config(text="BNO055: monitoring SYS/GYR/ACC/MAG calibration…")
+        self.status_var.set("Keep the device still, then rotate through 6 faces and figure-eight motion.")
+
+        def worker() -> None:
+            while self._bno_monitor_active and self.client.is_connected:
+                try:
+                    response = self.client.send_command("BNO_GET_STATUS", timeout=3.0)
+                except RuntimeError as exc:
+                    self.root.after(0, lambda: self._finish_bno_monitor(error=str(exc)))
+                    return
+                self.root.after(0, lambda resp=response: self._update_bno_monitor(resp))
+                time.sleep(0.5)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_bno_monitor(self, response: str | None) -> None:
+        if not self._bno_monitor_active:
+            return
+        kind, payload = parse_cal_response(response or "")
+        if kind == "BNO_ERR" and payload:
+            self._finish_bno_monitor(error=str(payload.get("message", "Unknown BNO055 error")))
+            return
+        if kind != "BNO_STATUS" or not payload:
+            self._finish_bno_monitor(error=f"Unexpected response: {response or 'timeout'}")
+            return
+
+        self._bno_status = payload
+        sys_v = int(payload.get("sys", 0))
+        gyr_v = int(payload.get("gyr", 0))
+        acc_v = int(payload.get("acc", 0))
+        mag_v = int(payload.get("mag", 0))
+        pct = ((sys_v + gyr_v + acc_v + mag_v) / 12.0) * 100.0
+        self.progress_bar["value"] = pct
+        self.capture_detail.config(text=f"SYS={sys_v}/3  GYR={gyr_v}/3  ACC={acc_v}/3  MAG={mag_v}/3")
+        self.status_var.set(
+            "Gyro: keep still. Accel: use 6 stable orientations. Mag: rotate in random 3D / figure-eight motion."
+        )
+        if sys_v == 3 and gyr_v == 3 and acc_v == 3 and mag_v == 3:
+            self._finish_bno_monitor(success=True)
+
+    def _finish_bno_monitor(self, success: bool = False, error: str | None = None) -> None:
+        self._bno_monitor_active = False
+        self._set_capture_ui(active=False)
+        if error:
+            self.status_var.set("BNO055 calibration monitor failed.")
+            messagebox.showerror("BNO055 Calibration", error)
+            return
+        if success:
+            self.status_var.set("BNO055 fully calibrated. Read and save the device profile now.")
+            messagebox.showinfo(
+                "BNO055 Calibration Complete",
+                "SYS, GYR, ACC, and MAG all reached 3.\n\n"
+                "Now click 'Read & save device profile' to capture the 22-byte profile.",
+            )
+
+    def _bno_read_profile_from_device(self) -> None:
+        if not self._ensure_connected():
+            return
+
+        def worker() -> None:
+            try:
+                response = self.client.send_command("BNO_READ_PROFILE", timeout=5.0)
+            except RuntimeError as exc:
+                self.root.after(0, lambda: messagebox.showerror("BNO055 Profile", str(exc)))
+                return
+            self.root.after(0, lambda: self._on_bno_profile_read(response))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bno_profile_read(self, response: str | None) -> None:
+        kind, payload = parse_cal_response(response or "")
+        if kind == "BNO_PROFILE" and payload:
+            self._bno_profile = payload
+            self._refresh_cal_table()
+            self.status_var.set("BNO055 profile read from device.")
+            messagebox.showinfo("BNO055 Profile", "BNO055 calibration profile read from device.\nUse Export JSON to save it.")
+            return
+        if kind == "BNO_ERR" and payload:
+            messagebox.showerror("BNO055 Profile", str(payload.get("message", "Unknown BNO055 error")))
+            return
+        messagebox.showerror("BNO055 Profile", f"Unexpected response: {response or 'timeout'}")
+
+    def _bno_write_profile_to_device(self) -> None:
+        if not self._ensure_connected():
+            return
+        if not self._bno_profile:
+            messagebox.showerror("BNO055 Profile", "Import or read a BNO055 profile first.")
+            return
+
+        cmd = format_bno_write_profile_command(self._bno_profile)
+
+        def worker() -> None:
+            try:
+                response = self.client.send_command(cmd, timeout=5.0)
+            except RuntimeError as exc:
+                self.root.after(0, lambda: messagebox.showerror("BNO055 Write Failed", str(exc)))
+                return
+            self.root.after(0, lambda: self._on_bno_profile_written(response))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bno_profile_written(self, response: str | None) -> None:
+        kind, payload = parse_cal_response(response or "")
+        if kind == "BNO_WRITE_OK":
+            self.status_var.set("BNO055 calibration profile written to device.")
+            messagebox.showinfo("BNO055 Write Complete", "BNO055 calibration profile written to device.")
+            return
+        if kind == "BNO_ERR" and payload:
+            messagebox.showerror("BNO055 Write Failed", str(payload.get("message", "Unknown BNO055 error")))
+            return
+        messagebox.showerror("BNO055 Write Failed", f"Unexpected response: {response or 'timeout'}")
+
     def _cancel_capture(self) -> None:
+        self._bno_monitor_active = False
         self.capture.cancel()
         self._set_capture_ui(active=False)
         self.status_var.set("Capture cancelled.")
 
     def _ensure_connected(self) -> bool:
         if not self.client.is_connected:
-            messagebox.showerror("Not Connected", "Connect to the BMI160 serial port first.")
+            model_name = "BNO055" if self._is_bno055_mode() else "BMI160"
+            messagebox.showerror("Not Connected", f"Connect to the {model_name} serial port first.")
             return False
         return True
 
     def _ensure_calibration_mode(self) -> bool:
         if not self._ensure_connected():
             return False
+        if self._is_bno055_mode():
+            return True
         if not self._calibration_mode_on:
             messagebox.showerror(
                 "Calibration Mode",
@@ -838,6 +1096,13 @@ class BMI160CalibrationApp:
         on_success: callable,
         target_samples: int | None = None,
     ) -> None:
+        if self._is_bno055_mode():
+            messagebox.showinfo(
+                "BNO055 Workflow",
+                "BNO055 uses its own internal fusion calibration. Use the direct-I2C helper in "
+                "bno055_i2c.py to run begin(), wait_for_full_calibration(), and save/load the 22-byte profile.",
+            )
+            return
         if not self._ensure_calibration_mode():
             return
 
@@ -924,6 +1189,13 @@ class BMI160CalibrationApp:
         )
 
     def _start_accel_six_face(self) -> None:
+        if self._is_bno055_mode():
+            messagebox.showinfo(
+                "BNO055 Workflow",
+                "Six-face sample fitting is for raw IMUs like BMI160. For BNO055 use the internal "
+                "calibration-status workflow and save/load the device profile with bno055_i2c.py.",
+            )
+            return
         if not self._ensure_calibration_mode():
             return
 
@@ -1004,6 +1276,30 @@ class BMI160CalibrationApp:
         for item in self.cal_table.get_children():
             self.cal_table.delete(item)
 
+        if self._is_bno055_mode():
+            rows: list[tuple[str, str]] = []
+            if self._bno_status:
+                rows.extend(
+                    [
+                        ("BNO055 SYS cal", f"{int(self._bno_status.get('sys', 0))}/3"),
+                        ("BNO055 GYR cal", f"{int(self._bno_status.get('gyr', 0))}/3"),
+                        ("BNO055 ACC cal", f"{int(self._bno_status.get('acc', 0))}/3"),
+                        ("BNO055 MAG cal", f"{int(self._bno_status.get('mag', 0))}/3"),
+                    ]
+                )
+            if self._bno_profile:
+                rows.append(("Profile address", f"0x{int(self._bno_profile.get('address', 0)):02X}"))
+                rows.append(("Axis map config", f"0x{int(self._bno_profile.get('axis_map_config', 0)):02X}"))
+                rows.append(("Axis map sign", f"0x{int(self._bno_profile.get('axis_map_sign', 0)):02X}"))
+                profile_bytes = self._bno_profile.get("calibration_bytes", [])
+                rows.append(("Profile bytes", " ".join(f"{int(v):02X}" for v in profile_bytes)))
+            if not rows:
+                rows.append(("Status", "No BNO055 profile loaded yet — initialize and monitor calibration first"))
+            for param, value in rows:
+                self.cal_table.insert("", "end", values=(param, value))
+            self.save_path_var.set("Profile: BNO055 serial profile (use Export/Import JSON)")
+            return
+
         cal = self.store.data
         rows: list[tuple[str, str]] = [
             ("Gyro offset X", f"{cal.gyro_offset['x']:+.4f}"),
@@ -1041,7 +1337,13 @@ class BMI160CalibrationApp:
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.store.data.to_dict(), f, indent=2)
+            if self._is_bno055_mode():
+                if not self._bno_profile:
+                    messagebox.showerror("Export Failed", "Read or import a BNO055 profile first.")
+                    return
+                json.dump({"imu_model": "BNO055", "bno055_profile": self._bno_profile}, f, indent=2)
+            else:
+                json.dump(self.store.data.to_dict(), f, indent=2)
         messagebox.showinfo("Exported", f"Calibration exported to:\n{path}")
 
     def _import_calibration(self) -> None:
@@ -1049,10 +1351,20 @@ class BMI160CalibrationApp:
         if not path:
             return
         with open(path, "r", encoding="utf-8") as f:
-            self.store.data = self.store.data.from_dict(json.load(f))
-        self.store.save()
-        self._refresh_cal_table()
-        messagebox.showinfo("Imported", f"Calibration loaded from:\n{path}")
+            payload = json.load(f)
+        if self._is_bno055_mode():
+            profile = payload.get("bno055_profile", payload)
+            if "calibration_bytes" not in profile:
+                messagebox.showerror("Import Failed", "This JSON does not contain a BNO055 profile.")
+                return
+            self._bno_profile = profile
+            self._refresh_cal_table()
+            messagebox.showinfo("Imported", f"BNO055 profile loaded from:\n{path}")
+        else:
+            self.store.data = self.store.data.from_dict(payload)
+            self.store.save()
+            self._refresh_cal_table()
+            messagebox.showinfo("Imported", f"Calibration loaded from:\n{path}")
 
     def _reset_calibration(self) -> None:
         if not messagebox.askyesno("Reset", "Clear all calibration values?"):
