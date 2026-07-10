@@ -12,6 +12,85 @@ import numpy as np
 
 GRAVITY = 9.80665
 
+IMU_MODEL_BMI160 = "BMI160"
+IMU_MODEL_BNO055 = "BNO055"
+CALIBRATION_FORMAT_VERSION = 1
+
+
+def imu_model_store_slug(model_label: str) -> str:
+    if "BNO055" in str(model_label).upper():
+        return "bno055"
+    return "bmi160"
+
+
+def normalize_imu_model(value: str | None) -> str:
+    if value and "BNO055" in str(value).upper():
+        return IMU_MODEL_BNO055
+    return IMU_MODEL_BMI160
+
+
+def default_calibration_store_path(model_label: str) -> Path:
+    slug = imu_model_store_slug(model_label)
+    return Path.home() / ".config" / "dronivo" / f"{slug}_calibration.json"
+
+
+def default_export_filename(model_label: str) -> str:
+    slug = imu_model_store_slug(model_label)
+    return f"IMU_Calibration_{slug.upper()}.json"
+
+
+def infer_imu_model_from_payload(payload: dict[str, Any]) -> str:
+    if payload.get("imu_model"):
+        return normalize_imu_model(payload["imu_model"])
+    if payload.get("bno055_profile") or payload.get("calibration_bytes"):
+        return IMU_MODEL_BNO055
+    return IMU_MODEL_BMI160
+
+
+def build_bno055_export_payload(profile: dict[str, Any], model_label: str) -> dict[str, Any]:
+    return {
+        "imu_model": normalize_imu_model(model_label),
+        "format_version": CALIBRATION_FORMAT_VERSION,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "bno055_profile": profile,
+    }
+
+
+def save_bno055_profile(profile: dict[str, Any], model_label: str, path: Path | None = None) -> Path:
+    target = path or default_calibration_store_path(model_label)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(build_bno055_export_payload(profile, model_label), f, indent=2)
+    return target
+
+
+def load_bno055_profile(model_label: str, path: Path | None = None) -> dict[str, Any] | None:
+    target = path or default_calibration_store_path(model_label)
+    if not target.exists():
+        return None
+    with open(target, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    profile = payload.get("bno055_profile", payload)
+    if "calibration_bytes" not in profile:
+        return None
+    return profile
+
+
+def build_bmi160_export_payload(cal: CalibrationData, model_label: str) -> dict[str, Any]:
+    saved_at = cal.saved_at or time.strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "imu_model": normalize_imu_model(model_label),
+        "format_version": CALIBRATION_FORMAT_VERSION,
+        "saved_at": saved_at,
+        "calibration": cal.to_dict(),
+    }
+
+
+def extract_bmi160_calibration(payload: dict[str, Any]) -> CalibrationData:
+    if "calibration" in payload:
+        return CalibrationData.from_dict(payload["calibration"])
+    return CalibrationData.from_dict(payload)
+
 
 def _vec3(data: dict[str, float], prefix: str) -> np.ndarray:
     return np.array([data[f"{prefix}x"], data[f"{prefix}y"], data[f"{prefix}z"]], dtype=float)
@@ -218,18 +297,21 @@ def mag_quality_metrics(samples: list[dict[str, float]], cal: CalibrationData) -
 
 
 class CalibrationStore:
-    def __init__(self, path: Path | None = None):
-        self.path = path or Path.home() / ".config" / "dronivo" / "bmi160_calibration.json"
+    def __init__(self, path: Path | None = None, model_label: str = IMU_MODEL_BMI160):
+        self.model_label = model_label
+        self.path = path or default_calibration_store_path(model_label)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = CalibrationData()
 
     def load(self) -> CalibrationData:
         if self.path.exists():
             with open(self.path, "r", encoding="utf-8") as f:
-                self.data = CalibrationData.from_dict(json.load(f))
+                payload = json.load(f)
+            self.data = extract_bmi160_calibration(payload)
         return self.data
 
     def save(self) -> None:
         self.data.saved_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        payload = build_bmi160_export_payload(self.data, self.model_label)
         with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.data.to_dict(), f, indent=2)
+            json.dump(payload, f, indent=2)
