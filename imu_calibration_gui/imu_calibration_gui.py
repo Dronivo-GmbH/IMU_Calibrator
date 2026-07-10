@@ -14,13 +14,15 @@ from calibration import (
     CalibrationStore,
     IMU_MODEL_BMI160 as BMI160_MODEL_ID,
     IMU_MODEL_BNO055 as BNO055_MODEL_ID,
+    CALIBRATION_CAPTURE_SECONDS,
+    CALIBRATION_CAPTURE_TIMEOUT_SECONDS,
+    CALIBRATION_MIN_SAMPLES,
     accel_calibration_valid,
     apply_calibration,
     build_bmi160_export_payload,
     build_bno055_export_payload,
-    calibrate_accel_single_face,
     calibrate_accel_six_face,
-    calibrate_gyro,
+    calibrate_level_pose,
     calibrate_mag_ellipsoid,
     calibrate_mag_hard_iron,
     default_calibration_store_path,
@@ -43,8 +45,6 @@ from sensor_units import StreamScale, normalize_sample, normalize_samples
 import viz_theme
 
 
-STATIC_CALIBRATION_SAMPLES = 500
-STATIC_CAPTURE_TIMEOUT_SECONDS = 60.0
 MAG_CAPTURE_SECONDS = 30.0
 IMU_MODEL_BMI160 = "BMI160 / compatible"
 IMU_MODEL_BNO055 = "BNO055"
@@ -73,23 +73,32 @@ class CalibrationCapture:
         on_complete: callable,
         on_error: callable | None = None,
         target_samples: int | None = None,
+        stop_after_seconds: float | None = None,
     ) -> None:
         self.cancel()
         self.active = True
         self.client.start_capture()
-        end_time = self.root.tk.call("clock", "milliseconds") + duration_s * 1000
+        start_ms = float(self.root.tk.call("clock", "milliseconds"))
+        end_time = start_ms + duration_s * 1000
+        capture_end_time = (
+            start_ms + stop_after_seconds * 1000 if stop_after_seconds is not None else end_time
+        )
 
         def tick() -> None:
             if not self.active:
                 return
 
-            remaining_ms = end_time - float(self.root.tk.call("clock", "milliseconds"))
-            remaining_s = max(0.0, remaining_ms / 1000.0)
+            now_ms = float(self.root.tk.call("clock", "milliseconds"))
+            remaining_s = max(0.0, (end_time - now_ms) / 1000.0)
+            capture_remaining_s: float | None = None
+            if stop_after_seconds is not None:
+                capture_remaining_s = max(0.0, (capture_end_time - now_ms) / 1000.0)
             sample_count = self.client.capture_count
-            on_tick(remaining_s, sample_count)
+            on_tick(remaining_s, sample_count, capture_remaining_s)
 
+            capture_done = stop_after_seconds is not None and now_ms >= capture_end_time
             target_reached = target_samples is not None and sample_count >= target_samples
-            if target_reached or remaining_s <= 0:
+            if capture_done or target_reached or remaining_s <= 0:
                 self.active = False
                 samples = self.client.stop_capture()
                 if not samples:
@@ -617,29 +626,32 @@ class BMI160CalibrationApp:
 
         instr = ttk.Label(
             frame,
-            text="Keep the device connected. Each workflow collects live samples with a countdown.",
+            text=(
+                "Static steps average samples over 30 seconds while you hold the IMU still "
+                "(same method as Live View → Level Your IMU). Export JSON to share calibration."
+            ),
             wraplength=900,
         )
         instr.grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
         self.calibration_instr = instr
 
         self.gyro_btn = ttk.Button(
-            frame, text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal
+            frame, text="1. Level calibration (30s)", command=self._start_level_cal
         )
         self.gyro_btn.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
 
         self.accel_flat_btn = ttk.Button(
-            frame, text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal
+            frame, text="2. Accel — Flat (+Z up)", command=self._start_accel_flat_cal
         )
         self.accel_flat_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
 
         self.accel_six_btn = ttk.Button(
-            frame, text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face
+            frame, text="2. Accel — Six-Face (30s each)", command=self._start_accel_six_face
         )
         self.accel_six_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
 
         self.mag_btn = ttk.Button(
-            frame, text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
+            frame, text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
         )
         self.mag_btn.grid(row=2, column=3, padx=4, pady=4, sticky="ew")
 
@@ -745,6 +757,7 @@ class BMI160CalibrationApp:
             )
             self.gyro_btn.config(text="1. BNO055 — Initialize / NDOF", command=self._bno_begin)
             self.accel_flat_btn.config(text="2. BNO055 — Monitor calibration status", command=self._bno_monitor_calibration)
+            self.accel_flat_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
             self.accel_six_btn.config(text="3. BNO055 — Read & save device profile", command=self._bno_read_profile_from_device)
             self.mag_btn.config(text="4. BNO055 — Write loaded profile to device", command=self._bno_write_profile_to_device)
             self.model_workflow_note.set(
@@ -756,12 +769,17 @@ class BMI160CalibrationApp:
                 self.status_var.set("Connect your BNO055-over-serial board and click Initialize / NDOF first.")
         else:
             self.calibration_instr.config(
-                text="Keep the device connected. Each workflow collects live samples with a countdown."
+                text=(
+                    "Static steps average samples over 30 seconds while you hold the IMU still "
+                    "(same method as Live View → Level Your IMU). Export JSON to share calibration."
+                )
             )
-            self.gyro_btn.config(text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal)
-            self.accel_flat_btn.config(text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal)
-            self.accel_six_btn.config(text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face)
-            self.mag_btn.config(text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
+            self.gyro_btn.config(text="1. Level calibration (30s)", command=self._start_level_cal)
+            self.accel_flat_btn.grid_remove()
+            self.accel_six_btn.config(text="2. Accel — Six-Face (30s each)", command=self._start_accel_six_face)
+            self.accel_six_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+            self.mag_btn.config(text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
+            self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
             self.model_workflow_note.set(
                 "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160.json."
             )
@@ -780,7 +798,8 @@ class BMI160CalibrationApp:
             return
 
         self.gyro_btn.config(state=base_state)
-        self.accel_flat_btn.config(state=base_state)
+        if self._is_bno055_mode():
+            self.accel_flat_btn.config(state=base_state)
         self.accel_six_btn.config(state=base_state)
         self.mag_btn.config(state="normal" if self.client.has_magnetometer and not self._ui_disabled else "disabled")
 
@@ -1262,6 +1281,7 @@ class BMI160CalibrationApp:
         min_samples: int,
         on_success: callable,
         target_samples: int | None = None,
+        capture_seconds: float | None = None,
     ) -> None:
         if self._is_bno055_mode():
             messagebox.showinfo(
@@ -1277,15 +1297,22 @@ class BMI160CalibrationApp:
         self.progress_label.config(text=instruction)
         self.status_var.set(instruction)
 
-        def on_tick(remaining_s: float, sample_count: int) -> None:
-            if target_samples:
+        def on_tick(remaining_s: float, sample_count: int, capture_remaining_s: float | None = None) -> None:
+            if capture_seconds is not None and capture_remaining_s is not None:
+                elapsed = capture_seconds - capture_remaining_s
+                elapsed_pct = min(100.0, max(0.0, (elapsed / capture_seconds) * 100.0))
+                time_left = capture_remaining_s
+            elif target_samples:
                 elapsed_pct = min(100, (sample_count / target_samples) * 100)
+                time_left = remaining_s
             else:
                 elapsed_pct = (1.0 - remaining_s / duration_s) * 100
+                time_left = remaining_s
             self.progress_bar["value"] = elapsed_pct
             target_text = f" / {target_samples}" if target_samples else ""
+            cap_text = f" ·  {capture_seconds:.0f}s window" if capture_seconds else ""
             self.capture_detail.config(
-                text=f"Time left: {remaining_s:4.1f}s   ·   Samples: {sample_count}{target_text}"
+                text=f"Time left: {time_left:4.1f}s{cap_text}   ·   Samples: {sample_count}{target_text}"
             )
 
         def on_complete(samples: list[dict]) -> None:
@@ -1303,57 +1330,52 @@ class BMI160CalibrationApp:
             self._set_capture_ui(active=False)
             messagebox.showerror("Capture Failed", msg)
 
-        self.capture.start(duration_s, on_tick, on_complete, on_error, target_samples=target_samples)
+        self.capture.start(
+            duration_s, on_tick, on_complete, on_error,
+            target_samples=target_samples,
+            stop_after_seconds=capture_seconds,
+        )
+
+    def _start_level_cal(self) -> None:
+        def finish(samples: list[dict]) -> None:
+            samples = self._normalize_samples(samples)
+            gyro_offset, accel_offset, accel_scale = calibrate_level_pose(samples, gravity_axis="z")
+            self.store.data.gyro_offset = gyro_offset
+            self.store.data.accel_offset = accel_offset
+            self.store.data.accel_scale = accel_scale
+            self.store.save()
+            self._refresh_cal_table()
+            messagebox.showinfo(
+                "Level Calibration Complete",
+                f"Averaged {len(samples)} samples over {CALIBRATION_CAPTURE_SECONDS:.0f} s.\n\n"
+                f"Gyro offset (deg/s):\n"
+                f"  X = {gyro_offset['x']:+.6f}\n"
+                f"  Y = {gyro_offset['y']:+.6f}\n"
+                f"  Z = {gyro_offset['z']:+.6f}\n\n"
+                f"Accel offset (m/s²), +Z up:\n"
+                f"  X = {accel_offset['x']:+.6f}\n"
+                f"  Y = {accel_offset['y']:+.6f}\n"
+                f"  Z = {accel_offset['z']:+.6f}\n\n"
+                "Saved to calibration JSON. Use Export JSON to share, or Six-Face for higher accuracy.",
+            )
+            self.status_var.set(f"Level calibration saved ({len(samples)} samples).")
+
+        self._run_timed_capture(
+            CALIBRATION_CAPTURE_TIMEOUT_SECONDS,
+            (
+                f"Level: place IMU flat (+Z up), hold completely still for "
+                f"{CALIBRATION_CAPTURE_SECONDS:.0f} s…"
+            ),
+            min_samples=CALIBRATION_MIN_SAMPLES,
+            on_success=finish,
+            capture_seconds=CALIBRATION_CAPTURE_SECONDS,
+        )
 
     def _start_gyro_cal(self) -> None:
-        def finish(samples: list[dict]) -> None:
-            samples = self._normalize_samples(samples)
-            offset = calibrate_gyro(samples)
-            self.store.data.gyro_offset = offset
-            self.store.save()
-            self._refresh_cal_table()
-            messagebox.showinfo(
-                "Gyro Calibration Complete",
-                f"Zero-rate offsets (deg/s):\n"
-                f"  X = {offset['x']:+.6f}\n"
-                f"  Y = {offset['y']:+.6f}\n"
-                f"  Z = {offset['z']:+.6f}",
-            )
-            self.status_var.set("Gyro calibration saved.")
-
-        self._run_timed_capture(
-            STATIC_CAPTURE_TIMEOUT_SECONDS,
-            "Gyro: keep the IMU completely still until 500 samples are collected…",
-            min_samples=STATIC_CALIBRATION_SAMPLES,
-            on_success=finish,
-            target_samples=STATIC_CALIBRATION_SAMPLES,
-        )
+        self._start_level_cal()
 
     def _start_accel_flat_cal(self) -> None:
-        def finish(samples: list[dict]) -> None:
-            samples = self._normalize_samples(samples)
-            offset, scale = calibrate_accel_single_face(samples, gravity_axis="z")
-            self.store.data.accel_offset = offset
-            self.store.data.accel_scale = scale
-            self.store.save()
-            self._refresh_cal_table()
-            messagebox.showinfo(
-                "Accelerometer Calibration Complete",
-                f"Flat (+Z up) offsets (m/s²):\n"
-                f"  X = {offset['x']:+.6f}\n"
-                f"  Y = {offset['y']:+.6f}\n"
-                f"  Z = {offset['z']:+.6f}\n\n"
-                "For best accuracy, use the Six-Face Wizard.",
-            )
-            self.status_var.set("Accelerometer (flat) calibration saved.")
-
-        self._run_timed_capture(
-            STATIC_CAPTURE_TIMEOUT_SECONDS,
-            "Accel: place IMU flat with +Z pointing up until 500 samples are collected…",
-            min_samples=STATIC_CALIBRATION_SAMPLES,
-            on_success=finish,
-            target_samples=STATIC_CALIBRATION_SAMPLES,
-        )
+        self._start_level_cal()
 
     def _start_accel_six_face(self) -> None:
         if self._is_bno055_mode():
@@ -1397,10 +1419,12 @@ class BMI160CalibrationApp:
 
         messagebox.showinfo(
             "Six-Face Accelerometer Calibration Complete",
-            f"Offset (raw):\n"
-            f"  X = {offset['x']:+.2f}, Y = {offset['y']:+.2f}, Z = {offset['z']:+.2f}\n\n"
+            f"Averaged 30 s per position ({CALIBRATION_CAPTURE_SECONDS:.0f} s each).\n\n"
+            f"Offset (m/s²):\n"
+            f"  X = {offset['x']:+.6f}, Y = {offset['y']:+.6f}, Z = {offset['z']:+.6f}\n\n"
             f"Scale:\n"
-            f"  X = {scale['x']:.4f}, Y = {scale['y']:.4f}, Z = {scale['z']:.4f}",
+            f"  X = {scale['x']:.6f}, Y = {scale['y']:.6f}, Z = {scale['z']:.6f}\n\n"
+            "Saved to calibration JSON. Use Export JSON to share.",
         )
         self.status_var.set("Six-face accelerometer calibration saved.")
 

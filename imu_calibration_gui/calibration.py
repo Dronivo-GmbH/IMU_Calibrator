@@ -16,6 +16,11 @@ IMU_MODEL_BMI160 = "BMI160"
 IMU_MODEL_BNO055 = "BNO055"
 CALIBRATION_FORMAT_VERSION = 1
 
+# Static poses (level, six-face positions): average samples over this window.
+CALIBRATION_CAPTURE_SECONDS = 30.0
+CALIBRATION_MIN_SAMPLES = 50
+CALIBRATION_CAPTURE_TIMEOUT_SECONDS = CALIBRATION_CAPTURE_SECONDS + 10.0
+
 
 def imu_model_store_slug(model_label: str) -> str:
     if "BNO055" in str(model_label).upper():
@@ -78,11 +83,36 @@ def load_bno055_profile(model_label: str, path: Path | None = None) -> dict[str,
 
 def build_bmi160_export_payload(cal: CalibrationData, model_label: str) -> dict[str, Any]:
     saved_at = cal.saved_at or time.strftime("%Y-%m-%d %H:%M:%S")
+    cal_dict = cal.to_dict()
     return {
         "imu_model": normalize_imu_model(model_label),
         "format_version": CALIBRATION_FORMAT_VERSION,
         "saved_at": saved_at,
-        "calibration": cal.to_dict(),
+        "description": (
+            "BMI160 calibration profile for IMU_Calibrator. "
+            "Import in the GUI or send calibration fields to firmware with SET_CAL."
+        ),
+        "units": {
+            "gyro_offset": "deg/s",
+            "accel_offset": "m/s²",
+            "accel_scale": "dimensionless",
+            "mag_offset": "µT",
+        },
+        "capture": {
+            "method": "average_while_hold_still",
+            "static_pose_seconds": CALIBRATION_CAPTURE_SECONDS,
+            "notes": (
+                "Level step: place IMU flat (+Z up), hold still for 30 s. "
+                "Six-face: hold each orientation still for 30 s."
+            ),
+        },
+        "usage": {
+            "import": "IMU Calibration Tool → Calibration tab → Import JSON…",
+            "export": "Same tab → Export JSON… to share this file",
+            "device": "Connect IMU → Write calibration to device (sends SET_CAL to firmware)",
+            "fields_for_code": "Use the calibration object below (gyro_offset, accel_offset, accel_scale, mag_offset, mag_soft_iron)",
+        },
+        "calibration": cal_dict,
     }
 
 
@@ -138,6 +168,19 @@ def average_samples(samples: list[dict[str, float]], prefix: str) -> np.ndarray:
 def calibrate_gyro(samples: list[dict[str, float]]) -> dict[str, float]:
     mean = average_samples(samples, "g")
     return {"x": float(mean[0]), "y": float(mean[1]), "z": float(mean[2])}
+
+
+def calibrate_level_pose(
+    samples: list[dict[str, float]], gravity_axis: str = "z",
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """
+    One level still capture (e.g. 30 s) → gyro zero-rate + accel flat offsets.
+
+    Same approach as Live View “Level Your IMU”, persisted to calibration JSON.
+    """
+    gyro_offset = calibrate_gyro(samples)
+    accel_offset, accel_scale = calibrate_accel_single_face(samples, gravity_axis=gravity_axis)
+    return gyro_offset, accel_offset, accel_scale
 
 
 def calibrate_accel_single_face(samples: list[dict[str, float]], gravity_axis: str = "z") -> tuple[dict[str, float], dict[str, float]]:

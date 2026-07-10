@@ -7,10 +7,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
+from calibration import CALIBRATION_CAPTURE_SECONDS, CALIBRATION_MIN_SAMPLES
 from orientation_block import relative_rotation_from_level
 
-LEVEL_CAPTURE_SECONDS = 30.0
-LEVEL_MIN_SAMPLES = 50
+LEVEL_CAPTURE_SECONDS = CALIBRATION_CAPTURE_SECONDS
+LEVEL_MIN_SAMPLES = CALIBRATION_MIN_SAMPLES
 
 
 @dataclass
@@ -91,5 +92,8 @@ class LevelReference:
         if capturing and seconds_left is not None:
             return f"Hold IMU level and still… capturing zero  ·  {seconds_left:.0f}s left"
         if not self.active:
-            return "Place IMU level, hold still, then click Level Your IMU (30 s capture)"
+            return (
+                f"Place IMU level, hold still, then click Level Your IMU "
+                f"({int(LEVEL_CAPTURE_SECONDS)} s capture)"
+            )
         return "Ready — plotting relative to level zero  ·  click Stop level to reset"

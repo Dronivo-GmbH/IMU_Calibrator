@@ -12,7 +12,13 @@ from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import art3d
 
 import viz_theme as theme
-from calibration import ACCEL_FACES, calibrate_accel_six_face
+from calibration import (
+    ACCEL_FACES,
+    CALIBRATION_CAPTURE_SECONDS,
+    CALIBRATION_CAPTURE_TIMEOUT_SECONDS,
+    CALIBRATION_MIN_SAMPLES,
+    calibrate_accel_six_face,
+)
 
 # Rotation: body frame → world frame (columns = body axes in world coords)
 _POSE_ROT: dict[str, np.ndarray] = {
@@ -190,8 +196,9 @@ def _draw_px4_block(ax, pose: str, *, compact: bool = False) -> None:
 
 
 class SixFaceWizard:
-    CAPTURE_TIMEOUT_SECONDS = 60.0
-    TARGET_SAMPLES = 500
+    CAPTURE_TIMEOUT_SECONDS = CALIBRATION_CAPTURE_TIMEOUT_SECONDS
+    CAPTURE_SECONDS = CALIBRATION_CAPTURE_SECONDS
+    MIN_SAMPLES = CALIBRATION_MIN_SAMPLES
 
     STATUS_PENDING = "#e5e7eb"
     STATUS_ACTIVE = "#3b82f6"
@@ -252,7 +259,7 @@ class SixFaceWizard:
 
         tk.Label(
             header,
-            text="Hold the IMU in each orientation shown below, then capture. "
+            text="Hold the IMU in each orientation shown below, then capture for 30 seconds. "
                  "Rotate through all 6 positions like PX4 sensor calibration.",
             bg="#ffffff", fg=theme.MUTED, font=(theme.FONT, 9), wraplength=920, justify="left",
         ).pack(anchor="w", pady=(4, 0))
@@ -342,7 +349,9 @@ class SixFaceWizard:
         footer.pack(fill="x", padx=16, pady=(2, 10))
         ttk.Button(footer, text="Cancel", command=self._cancel).pack(side="left")
         self.capture_btn = ttk.Button(
-            footer, text="▶  Start capture (500 samples)", command=self._start_capture
+            footer,
+            text=f"▶  Start capture ({int(self.CAPTURE_SECONDS)} s)",
+            command=self._start_capture,
         )
         self.capture_btn.pack(side="right", padx=(8, 0))
         self.next_btn = ttk.Button(footer, text="Next position →", command=self._next_face, state="disabled")
@@ -439,25 +448,37 @@ class SixFaceWizard:
         self.capture_btn.config(state="disabled")
         self.next_btn.config(state="disabled")
         self.progress.config(style="CalibrationRunning.Horizontal.TProgressbar")
-        self.status_var.set("Hold completely still…")
+        self.status_var.set(f"Hold completely still for {self.CAPTURE_SECONDS:.0f} s…")
         self.capture.start(
             self.CAPTURE_TIMEOUT_SECONDS,
             on_tick=self._on_tick,
             on_complete=self._on_capture_done,
             on_error=self._on_capture_error,
-            target_samples=self.TARGET_SAMPLES,
+            stop_after_seconds=self.CAPTURE_SECONDS,
         )
 
-    def _on_tick(self, remaining_s: float, count: int) -> None:
-        self.progress["value"] = min(100, (count / self.TARGET_SAMPLES) * 100)
+    def _on_tick(
+        self, remaining_s: float, count: int, capture_remaining_s: float | None = None,
+    ) -> None:
+        if capture_remaining_s is not None:
+            elapsed = self.CAPTURE_SECONDS - capture_remaining_s
+            pct = min(100.0, max(0.0, (elapsed / self.CAPTURE_SECONDS) * 100.0))
+            time_left = capture_remaining_s
+        else:
+            pct = (1.0 - remaining_s / self.CAPTURE_TIMEOUT_SECONDS) * 100.0
+            time_left = remaining_s
+        self.progress["value"] = pct
         self.progress_label.set(
-            f"Capturing… {count} / {self.TARGET_SAMPLES} samples  ·  timeout {remaining_s:.1f}s"
+            f"Capturing… {count} samples  ·  {time_left:.1f}s left  ·  hold still"
         )
 
     def _on_capture_done(self, samples: list[dict]) -> None:
         self._capturing = False
-        if len(samples) < self.TARGET_SAMPLES:
-            self.status_var.set("Too few samples — check USB connection and try again.")
+        if len(samples) < self.MIN_SAMPLES:
+            self.status_var.set(
+                f"Too few samples ({len(samples)}, need ≥ {self.MIN_SAMPLES}) — "
+                "check USB connection and try again."
+            )
             self.capture_btn.config(state="normal")
             self.progress["value"] = 0
             self.progress.config(style="CalibrationIdle.Horizontal.TProgressbar")
@@ -466,7 +487,10 @@ class SixFaceWizard:
         self._face_samples.append(samples)
         self._face_done[self._face_index] = True
         self._update_overview_highlights()
-        self.progress_label.set(f"✓ Position {self._face_index + 1} saved ({len(samples)} samples)")
+        self.progress_label.set(
+            f"✓ Position {self._face_index + 1} saved "
+            f"({len(samples)} samples, {self.CAPTURE_SECONDS:.0f} s avg)"
+        )
 
         if self._face_index >= 5:
             self.next_btn.config(text="✓  Finish calibration", state="normal")
