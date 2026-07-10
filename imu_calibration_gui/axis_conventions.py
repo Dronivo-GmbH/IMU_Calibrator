@@ -49,7 +49,7 @@ def tilt_from_accel(ax_m: float, ay_m: float, az_m: float) -> tuple[float, float
     mag = float(math.hypot(ax_m, math.hypot(ay_m, az_m)))
     if mag < 0.5:
         return 0.0, 0.0
-    roll = math.degrees(math.atan2(ay_m, az_m))
+    roll = -math.degrees(math.atan2(ay_m, az_m))
     pitch = math.degrees(math.atan2(-ax_m, math.hypot(ay_m, az_m)))
     return roll, pitch
 
