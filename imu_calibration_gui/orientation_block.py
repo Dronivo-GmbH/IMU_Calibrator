@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from matplotlib.axes import Axes
 from mpl_toolkits.mplot3d import art3d
@@ -41,6 +43,21 @@ def rotation_from_accel(ax: float, ay: float, az: float) -> np.ndarray:
     return np.column_stack([x, y, z])
 
 
+def tilt_from_accel(ax_m: float, ay_m: float, az_m: float) -> tuple[float, float]:
+    """
+    Roll and pitch in degrees from accelerometer tilt (gravity vector).
+
+    Convention: level with +Z up → roll ≈ 0°, pitch ≈ 0°.
+    Yaw is not observable from accel alone.
+    """
+    mag = float(np.hypot(ax_m, np.hypot(ay_m, az_m)))
+    if mag < 0.5:
+        return 0.0, 0.0
+    roll = math.degrees(math.atan2(ay_m, az_m))
+    pitch = math.degrees(math.atan2(ax_m, math.hypot(ay_m, az_m)))
+    return roll, pitch
+
+
 def draw_orientation_block(
     ax: Axes,
     ax_m: float,
@@ -49,6 +66,8 @@ def draw_orientation_block(
     *,
     elev: float = 28.0,
     azim: float = -58.0,
+    roll_deg: float | None = None,
+    pitch_deg: float | None = None,
 ) -> None:
     """Draw a PX4-style IMU block oriented by the accelerometer reading."""
     ax.cla()
@@ -102,7 +121,11 @@ def draw_orientation_block(
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_zlim(-0.2, 1.65)
-    ax.set_title("Body orientation (from accel)", pad=8, fontsize=10, fontweight="bold", color=theme.TEXT)
+    if roll_deg is not None and pitch_deg is not None:
+        title = f"Body orientation  ·  Roll {roll_deg:+.1f}°  ·  Pitch {pitch_deg:+.1f}°"
+    else:
+        title = "Body orientation (from accel)"
+    ax.set_title(title, pad=8, fontsize=10, fontweight="bold", color=theme.TEXT)
     ax.set_xlabel("World X", fontsize=7, color=theme.MUTED, labelpad=2)
     ax.set_ylabel("World Y", fontsize=7, color=theme.MUTED, labelpad=2)
     ax.set_zlabel("World Z (up)", fontsize=7, color=theme.MUTED, labelpad=2)

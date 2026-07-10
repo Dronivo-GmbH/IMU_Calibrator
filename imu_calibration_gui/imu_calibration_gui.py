@@ -12,17 +12,29 @@ from tkinter import ttk, messagebox, filedialog
 from calibration import (
     CalibrationData,
     CalibrationStore,
+    IMU_MODEL_BMI160 as BMI160_MODEL_ID,
+    IMU_MODEL_BNO055 as BNO055_MODEL_ID,
     accel_calibration_valid,
     apply_calibration,
+    build_bmi160_export_payload,
+    build_bno055_export_payload,
     calibrate_accel_single_face,
     calibrate_accel_six_face,
     calibrate_gyro,
     calibrate_mag_ellipsoid,
     calibrate_mag_hard_iron,
+    default_calibration_store_path,
+    default_export_filename,
+    extract_bmi160_calibration,
+    infer_imu_model_from_payload,
+    load_bno055_profile,
     mag_quality_metrics,
+    normalize_imu_model,
+    save_bno055_profile,
 )
 from device_protocol import format_bno_write_profile_command, format_set_cal_command, parse_cal_response
 from filtering import EMA_PRESETS, FilterConfig, RuntimeEMAFilter, apply_runtime_filter
+from orientation_block import tilt_from_accel
 from six_face_wizard import open_six_face_wizard
 from imu_visualizer import IMUVisualizerWidget
 from mag_plot import MagPlotWidget
@@ -99,7 +111,9 @@ class BMI160CalibrationApp:
         self.root.geometry("1150x860")
         self.root.minsize(1050, 780)
 
-        self.store = CalibrationStore()
+        self.imu_model_var = tk.StringVar(value=IMU_MODEL_BMI160)
+        self._active_imu_model = IMU_MODEL_BMI160
+        self.store = CalibrationStore(model_label=IMU_MODEL_BMI160)
         self.store.load()
         self.client = SerialIMUClient(on_sample=self._on_sample)
         self.capture = CalibrationCapture(root, self.client)
@@ -274,8 +288,7 @@ class BMI160CalibrationApp:
         self.baud_entry.insert(0, "115200")
         self.baud_entry.grid(row=1, column=1, padx=(0, 8), pady=4, sticky="w")
 
-        ttk.Label(frame, text="IMU model").grid(row=0, column=2, sticky="w")
-        self.imu_model_var = tk.StringVar(value=IMU_MODEL_BMI160)
+        ttk.Label(frame, text="IMU model (select before connect)").grid(row=0, column=2, sticky="w")
         self.imu_model_combo = ttk.Combobox(
             frame,
             textvariable=self.imu_model_var,
@@ -352,10 +365,34 @@ class BMI160CalibrationApp:
         self.imu_visualizer = IMUVisualizerWidget(parent)
         self.imu_visualizer.pack(fill="both", expand=True)
 
+        tilt_row = ttk.Frame(parent)
+        tilt_row.pack(fill="x", pady=(10, 0))
+
+        self.live_value_vars: dict[str, tk.StringVar] = {}
+        for col, (title, key, color) in enumerate(
+            (
+                ("Roll (°)", "roll", viz_theme.AXIS_X),
+                ("Pitch (°)", "pitch", viz_theme.AXIS_Y),
+            )
+        ):
+            card = tk.Frame(
+                tilt_row, bg=viz_theme.PANEL, highlightbackground=viz_theme.BORDER, highlightthickness=1,
+            )
+            card.grid(row=0, column=col, padx=4, sticky="nsew")
+            tilt_row.columnconfigure(col, weight=1)
+
+            tk.Label(card, text=title, bg=viz_theme.PANEL, fg=viz_theme.MUTED, font=(viz_theme.FONT, 10)).pack(
+                anchor="w", padx=12, pady=(10, 0),
+            )
+            var = tk.StringVar(value="—")
+            self.live_value_vars[key] = var
+            tk.Label(card, textvariable=var, bg=viz_theme.PANEL, fg=color, font=(viz_theme.FONT, 22, "bold")).pack(
+                anchor="w", padx=12, pady=(4, 12),
+            )
+
         metrics = ttk.Frame(parent)
         metrics.pack(fill="x", pady=(10, 0))
 
-        self.live_value_vars: dict[str, tk.StringVar] = {}
         cards = [
             ("Ax (m/s²)", "ax", viz_theme.AXIS_X),
             ("Ay (m/s²)", "ay", viz_theme.AXIS_Y),
@@ -453,6 +490,7 @@ class BMI160CalibrationApp:
             ("mag_corr", "Magnetometer — Corrected"),
             ("acc_filt", "Accelerometer — Filtered (EMA)"),
             ("gyro_filt", "Gyroscope — Filtered (EMA)"),
+            ("tilt_filt", "Tilt — Filtered (from accel)"),
         ):
             self._readout_row_ids[key] = self.readout_table.insert(
                 "", "end", values=(label, "—", "—", "—"),
@@ -525,48 +563,72 @@ class BMI160CalibrationApp:
                 values = tuple(f"{data.get(f, 0):+.3f}" for f in fields)
             self.readout_table.item(self._readout_row_ids[key], values=(label, *values))
 
+        if filtered:
+            roll, pitch = tilt_from_accel(filtered.get("ax", 0.0), filtered.get("ay", 0.0), filtered.get("az", 0.0))
+            self.readout_table.item(
+                self._readout_row_ids["tilt_filt"],
+                values=("Tilt — Filtered (from accel)", f"{roll:+.2f}", f"{pitch:+.2f}", "—"),
+            )
+
     def _build_calibration_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Calibration Workflows", padding=12, style="Section.TLabelframe")
         frame.pack(fill="x", pady=(0, 10))
+
+        model_row = ttk.Frame(frame)
+        model_row.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ttk.Label(model_row, text="Target IMU model:", font=(viz_theme.FONT, 10, "bold")).pack(side="left")
+        self.cal_imu_model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.imu_model_var,
+            values=[IMU_MODEL_BMI160, IMU_MODEL_BNO055],
+            width=24,
+            state="readonly",
+        )
+        self.cal_imu_model_combo.pack(side="left", padx=(8, 12))
+        self.cal_imu_model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_imu_model_changed())
+        self.model_profile_var = tk.StringVar(value="")
+        ttk.Label(model_row, textvariable=self.model_profile_var, foreground=viz_theme.MUTED).pack(
+            side="left", fill="x", expand=True
+        )
 
         instr = ttk.Label(
             frame,
             text="Keep the device connected. Each workflow collects live samples with a countdown.",
             wraplength=900,
         )
-        instr.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        instr.grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
         self.calibration_instr = instr
 
         self.gyro_btn = ttk.Button(
             frame, text="1. Gyro — Keep Still (500 samples)", command=self._start_gyro_cal
         )
-        self.gyro_btn.grid(row=1, column=0, padx=4, pady=4, sticky="ew")
+        self.gyro_btn.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
 
         self.accel_flat_btn = ttk.Button(
             frame, text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal
         )
-        self.accel_flat_btn.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        self.accel_flat_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
 
         self.accel_six_btn = ttk.Button(
             frame, text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face
         )
-        self.accel_six_btn.grid(row=1, column=2, padx=4, pady=4, sticky="ew")
+        self.accel_six_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
 
         self.mag_btn = ttk.Button(
             frame, text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal
         )
-        self.mag_btn.grid(row=1, column=3, padx=4, pady=4, sticky="ew")
+        self.mag_btn.grid(row=2, column=3, padx=4, pady=4, sticky="ew")
 
         self.model_workflow_note = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.model_workflow_note, foreground=viz_theme.MUTED, wraplength=900).grid(
-            row=4, column=0, columnspan=4, sticky="w", pady=(8, 0)
+            row=5, column=0, columnspan=4, sticky="w", pady=(8, 0)
         )
 
         for col in range(4):
             frame.columnconfigure(col, weight=1)
 
         progress_frame = ttk.Frame(frame)
-        progress_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 4))
+        progress_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 4))
 
         self.progress_label = ttk.Label(progress_frame, text="Ready")
         self.progress_label.pack(anchor="w")
@@ -583,7 +645,7 @@ class BMI160CalibrationApp:
         self.capture_detail.pack(anchor="w")
 
         action_frame = ttk.Frame(frame)
-        action_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        action_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         self.cancel_btn = ttk.Button(action_frame, text="Cancel Capture", command=self._cancel_capture, state="disabled")
         self.cancel_btn.pack(side="left", padx=(0, 8))
@@ -597,7 +659,53 @@ class BMI160CalibrationApp:
         ttk.Label(parent, textvariable=self.status_var, relief="sunken", padding=6).pack(fill="x")
 
     def _on_imu_model_changed(self) -> None:
+        selected = self.imu_model_var.get()
+        if selected == self._active_imu_model:
+            return
+        if self.client.is_connected:
+            messagebox.showwarning(
+                "IMU Model Locked",
+                "Disconnect before changing the target IMU model.",
+            )
+            self.imu_model_var.set(self._active_imu_model)
+            return
+
+        self._active_imu_model = selected
+        self._load_store_for_current_model()
         self._refresh_imu_model_ui()
+        self._refresh_cal_table()
+
+    def _load_store_for_current_model(self) -> None:
+        model = self.imu_model_var.get()
+        self.store = CalibrationStore(model_label=model)
+        self.store.load()
+        self._bno_profile = load_bno055_profile(model) if self._is_bno055_mode() else None
+        self._bno_status = None
+
+    def _set_imu_model_controls_enabled(self, enabled: bool) -> None:
+        state = "readonly" if enabled else "disabled"
+        self.imu_model_combo.config(state=state)
+        if hasattr(self, "cal_imu_model_combo"):
+            self.cal_imu_model_combo.config(state=state)
+
+    def _current_model_id(self) -> str:
+        return normalize_imu_model(self.imu_model_var.get())
+
+    def _update_model_profile_label(self) -> None:
+        model_id = self._current_model_id()
+        export_name = default_export_filename(self.imu_model_var.get())
+        if self._is_bno055_mode():
+            store_path = default_calibration_store_path(self.imu_model_var.get())
+            self.model_profile_var.set(
+                f"Profile store: {store_path.name} · export as {export_name}"
+            )
+        else:
+            self.model_profile_var.set(
+                f"Profile store: {self.store.path.name} · export as {export_name}"
+            )
+        self.save_path_var.set(
+            f"IMU: {model_id} · profile: {self.store.path if not self._is_bno055_mode() else default_calibration_store_path(self.imu_model_var.get())}"
+        )
 
     def _is_bno055_mode(self) -> bool:
         return self.imu_model_var.get() == IMU_MODEL_BNO055
@@ -630,9 +738,12 @@ class BMI160CalibrationApp:
             self.accel_flat_btn.config(text="2. Accel — Flat (+Z up, 500 samples)", command=self._start_accel_flat_cal)
             self.accel_six_btn.config(text="3. Accel — Six-Face Wizard", command=self._start_accel_six_face)
             self.mag_btn.config(text="4. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
-            self.model_workflow_note.set("")
+            self.model_workflow_note.set(
+                "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160.json."
+            )
             if not self.client.is_connected:
-                self.status_var.set("Connect your BMI160 board and start a calibration workflow.")
+                self.status_var.set("Select BMI160, connect your board, turn ON calibration mode, then run workflows.")
+        self._update_model_profile_label()
         self._apply_mode_button_states()
 
     def _apply_mode_button_states(self) -> None:
@@ -693,6 +804,7 @@ class BMI160CalibrationApp:
         self.conn_status.config(text=f"Connected · {port}", style="Status.Connected.TLabel")
         self.connect_btn.config(state="disabled")
         self.disconnect_btn.config(state="normal")
+        self._set_imu_model_controls_enabled(False)
         self._calibration_mode_on = False
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
@@ -722,6 +834,7 @@ class BMI160CalibrationApp:
         self.conn_status.config(text="Disconnected", style="Status.Disconnected.TLabel")
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
+        self._set_imu_model_controls_enabled(True)
         self._calibration_mode_on = False
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
@@ -813,6 +926,10 @@ class BMI160CalibrationApp:
             self.live_value_vars["gx"].set(f"{filtered['gx']:+.3f}")
             self.live_value_vars["gy"].set(f"{filtered['gy']:+.3f}")
             self.live_value_vars["gz"].set(f"{filtered['gz']:+.3f}")
+
+            roll, pitch = tilt_from_accel(filtered["ax"], filtered["ay"], filtered["az"])
+            self.live_value_vars["roll"].set(f"{roll:+.2f}")
+            self.live_value_vars["pitch"].set(f"{pitch:+.2f}")
 
             self.rate_var.set(f"Sample rate  {self.client.sample_rate_hz:.1f} Hz")
             self.total_var.set(f"Samples  {self.client.total_samples:,}")
@@ -1023,6 +1140,7 @@ class BMI160CalibrationApp:
         kind, payload = parse_cal_response(response or "")
         if kind == "BNO_PROFILE" and payload:
             self._bno_profile = payload
+            save_bno055_profile(payload, self.imu_model_var.get())
             self._refresh_cal_table()
             self.status_var.set("BNO055 profile read from device.")
             messagebox.showinfo("BNO055 Profile", "BNO055 calibration profile read from device.\nUse Export JSON to save it.")
@@ -1297,7 +1415,7 @@ class BMI160CalibrationApp:
                 rows.append(("Status", "No BNO055 profile loaded yet — initialize and monitor calibration first"))
             for param, value in rows:
                 self.cal_table.insert("", "end", values=(param, value))
-            self.save_path_var.set("Profile: BNO055 serial profile (use Export/Import JSON)")
+            self._update_model_profile_label()
             return
 
         cal = self.store.data
@@ -1326,25 +1444,47 @@ class BMI160CalibrationApp:
         for param, value in rows:
             self.cal_table.insert("", "end", values=(param, value))
 
-        self.save_path_var.set(f"Profile: {self.store.path}")
+        self._update_model_profile_label()
+
+    def _confirm_import_model(self, payload: dict) -> bool:
+        file_model = infer_imu_model_from_payload(payload)
+        selected_model = self._current_model_id()
+        if file_model == selected_model:
+            return True
+        return messagebox.askyesno(
+            "IMU Model Mismatch",
+            (
+                f"This file is for {file_model}, but you have {selected_model} selected.\n\n"
+                f"Switch to {file_model} and import this profile?"
+            ),
+        )
+
+    def _switch_to_model_for_import(self, model_id: str) -> None:
+        label = IMU_MODEL_BNO055 if model_id == BNO055_MODEL_ID else IMU_MODEL_BMI160
+        self.imu_model_var.set(label)
+        self._active_imu_model = label
+        self._load_store_for_current_model()
+        self._refresh_imu_model_ui()
 
     def _export_calibration(self) -> None:
+        export_name = default_export_filename(self.imu_model_var.get())
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
-            initialfile="IMU_Calibration.json",
+            initialfile=export_name,
         )
         if not path:
             return
+        if self._is_bno055_mode():
+            if not self._bno_profile:
+                messagebox.showerror("Export Failed", "Read or import a BNO055 profile first.")
+                return
+            payload = build_bno055_export_payload(self._bno_profile, self.imu_model_var.get())
+        else:
+            payload = build_bmi160_export_payload(self.store.data, self.imu_model_var.get())
         with open(path, "w", encoding="utf-8") as f:
-            if self._is_bno055_mode():
-                if not self._bno_profile:
-                    messagebox.showerror("Export Failed", "Read or import a BNO055 profile first.")
-                    return
-                json.dump({"imu_model": "BNO055", "bno055_profile": self._bno_profile}, f, indent=2)
-            else:
-                json.dump(self.store.data.to_dict(), f, indent=2)
-        messagebox.showinfo("Exported", f"Calibration exported to:\n{path}")
+            json.dump(payload, f, indent=2)
+        messagebox.showinfo("Exported", f"{self._current_model_id()} calibration exported to:\n{path}")
 
     def _import_calibration(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
@@ -1352,28 +1492,49 @@ class BMI160CalibrationApp:
             return
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
+
+        file_model = infer_imu_model_from_payload(payload)
+        if file_model != self._current_model_id():
+            if not self._confirm_import_model(payload):
+                return
+            if self.client.is_connected:
+                messagebox.showwarning(
+                    "IMU Model Locked",
+                    "Disconnect before switching IMU model to import this file.",
+                )
+                return
+            self._switch_to_model_for_import(file_model)
+
         if self._is_bno055_mode():
             profile = payload.get("bno055_profile", payload)
             if "calibration_bytes" not in profile:
                 messagebox.showerror("Import Failed", "This JSON does not contain a BNO055 profile.")
                 return
             self._bno_profile = profile
+            save_bno055_profile(profile, self.imu_model_var.get())
             self._refresh_cal_table()
             messagebox.showinfo("Imported", f"BNO055 profile loaded from:\n{path}")
         else:
-            self.store.data = self.store.data.from_dict(payload)
+            self.store.data = extract_bmi160_calibration(payload)
             self.store.save()
             self._refresh_cal_table()
-            messagebox.showinfo("Imported", f"Calibration loaded from:\n{path}")
+            messagebox.showinfo("Imported", f"BMI160 calibration loaded from:\n{path}")
 
     def _reset_calibration(self) -> None:
-        if not messagebox.askyesno("Reset", "Clear all calibration values?"):
+        if not messagebox.askyesno("Reset", f"Clear all {self._current_model_id()} calibration values?"):
             return
-        from calibration import CalibrationData
-        self.store.data = CalibrationData()
-        self.store.save()
+        if self._is_bno055_mode():
+            self._bno_profile = None
+            self._bno_status = None
+            store_path = default_calibration_store_path(self.imu_model_var.get())
+            if store_path.exists():
+                store_path.unlink()
+        else:
+            from calibration import CalibrationData
+            self.store.data = CalibrationData()
+            self.store.save()
         self._refresh_cal_table()
-        self.status_var.set("Calibration reset to defaults.")
+        self.status_var.set(f"{self._current_model_id()} calibration reset to defaults.")
 
     def _write_calibration_to_device(self) -> None:
         if not self._ensure_connected():

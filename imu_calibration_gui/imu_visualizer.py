@@ -14,7 +14,7 @@ from matplotlib.gridspec import GridSpec
 
 import viz_theme as theme
 from calibration import GRAVITY
-from orientation_block import draw_orientation_block
+from orientation_block import draw_orientation_block, tilt_from_accel
 
 DEFAULT_ELEV = 28
 DEFAULT_AZIM = -58
@@ -121,6 +121,18 @@ class IMUVisualizerWidget(tk.Frame):
             header, text="Calibrated + EMA filtered · m/s² · deg/s", bg=theme.BG, fg=theme.MUTED,
             font=(theme.FONT, 10),
         ).pack(side="left", padx=(12, 0))
+
+        self.roll_var = tk.StringVar(value="Roll  —")
+        tk.Label(
+            header, textvariable=self.roll_var, bg=theme.BG, fg=theme.AXIS_X,
+            font=(theme.FONT, 12, "bold"),
+        ).pack(side="left", padx=(18, 0))
+
+        self.pitch_var = tk.StringVar(value="Pitch  —")
+        tk.Label(
+            header, textvariable=self.pitch_var, bg=theme.BG, fg=theme.AXIS_Y,
+            font=(theme.FONT, 12, "bold"),
+        ).pack(side="left", padx=(14, 0))
 
         self.stats_var = tk.StringVar(value="Waiting for stream…")
         tk.Label(
@@ -252,10 +264,15 @@ class IMUVisualizerWidget(tk.Frame):
         except tk.TclError:
             pass
 
-    def _update_orientation(self, ax: float, ay: float, az: float) -> None:
+    def _update_orientation(self, ax: float, ay: float, az: float) -> tuple[float, float]:
         elev = self.ax_orientation.elev
         azim = self.ax_orientation.azim
-        draw_orientation_block(self.ax_orientation, ax, ay, az, elev=elev, azim=azim)
+        roll, pitch = tilt_from_accel(ax, ay, az)
+        draw_orientation_block(
+            self.ax_orientation, ax, ay, az,
+            elev=elev, azim=azim, roll_deg=roll, pitch_deg=pitch,
+        )
+        return roll, pitch
 
     def _draw_idle_state(self) -> None:
         if not self._initialized:
@@ -311,11 +328,13 @@ class IMUVisualizerWidget(tk.Frame):
         pad = (ymax - ymin) * 0.12 if ymax > ymin else 1.0
         self.ax_mag.set_ylim(ymin - pad, ymax + pad)
 
-        self._update_orientation(float(ax[-1]), float(ay[-1]), float(az[-1]))
+        roll, pitch = self._update_orientation(float(ax[-1]), float(ay[-1]), float(az[-1]))
 
+        self.roll_var.set(f"Roll  {roll:+.1f}°")
+        self.pitch_var.set(f"Pitch  {pitch:+.1f}°")
         self.stats_var.set(
             f"{len(self._samples)} samples  ·  "
-            f"a=[{ax[-1]:+.2f}, {ay[-1]:+.2f}, {az[-1]:+.2f}] m/s²  ·  "
+            f"Roll {roll:+.1f}°  ·  Pitch {pitch:+.1f}°  ·  "
             f"|ω| {gyro_mag[-1]:.2f} °/s  ·  {self.window_seconds:.0f}s"
         )
 
