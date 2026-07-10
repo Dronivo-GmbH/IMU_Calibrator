@@ -1,29 +1,22 @@
 /*
- * BMI160 (+ optional BMM150) serial streamer for IMU calibration GUI
+ * BMI160 serial streamer for IMU calibration GUI
  *
- * Hardware: Arduino Uno/Nano/Mega or ESP32 + BMI160 I2C breakout
- * Optional BMM150 on auxiliary port (SparkFun 9-DoF) or separate I2C 0x10
+ * Hardware: ESP32 / Arduino + BMI160 I2C breakout (6-axis; mag streamed as 0)
  *
- * Required libraries (Arduino Library Manager):
- *   - SparkFun BMI160 Arduino Library
+ * Required library (Arduino Library Manager):
  *   - ArduinoJson (by Benoit Blanchon) v6.x
  *
- * Wiring (I2C):
- *   SDA -> A4 (Uno) / GPIO21 (ESP32)
- *   SCL -> A5 (Uno) / GPIO22 (ESP32)
+ * Wiring (ESP32):
+ *   SDA -> GPIO21
+ *   SCL -> GPIO22
+ *   3.3V -> VCC
+ *   GND  -> GND
  *
  * Serial: 115200 baud
  *
  * Protocol:
  *   Stream:  ax,ay,az,gx,gy,gz,mx,my,mz
- *   Commands:
- *     PING
- *     CAL_MODE_ON
- *     CAL_MODE_OFF
- *     GET_CAL
- *     SET_CAL {"gyro_offset":{...}, ...}
- *   Responses:
- *     PONG / CAL_MODE_ON / CAL_MODE_OFF / CAL_OK / CAL_ERR / CAL {...json...}
+ *   Commands: PING, CAL_MODE_ON, CAL_MODE_OFF, GET_CAL, SET_CAL {...}, I2C_SCAN
  */
 
 #include <Wire.h>
@@ -35,13 +28,29 @@
 #include <EEPROM.h>
 #endif
 
-#include "SparkFunBMI160.h"
-#include "SparkFunBMM150Aux.h"
+// ---------- BMI160 registers ----------
+static const uint8_t REG_CHIP_ID = 0x00;
+static const uint8_t REG_GYR_DATA = 0x0C;
+static const uint8_t REG_ACC_DATA = 0x12;
+static const uint8_t REG_ACC_CONF = 0x40;
+static const uint8_t REG_ACC_RANGE = 0x41;
+static const uint8_t REG_GYR_CONF = 0x42;
+static const uint8_t REG_GYR_RANGE = 0x43;
+static const uint8_t REG_PWR_CONF = 0x7C;
+static const uint8_t REG_PMU_STATUS = 0x03;
+static const uint8_t REG_PMU_TRIGGER = 0x6C;
+
+static const uint8_t BMI160_CHIP_ID = 0xD1;
+static const uint8_t CMD_SOFT_RESET = 0xB6;
+static const uint8_t CMD_ACCEL_NORMAL = 0x11;
+static const uint8_t CMD_GYRO_NORMAL = 0x15;
+static const uint8_t REG_CMD = 0x7E;
 
 // ---------- Config ----------
 static const uint32_t SERIAL_BAUD = 115200;
 static const uint32_t SAMPLE_HZ = 100;
 static const uint32_t SAMPLE_MS = 1000 / SAMPLE_HZ;
+static const uint32_t I2C_CLOCK_HZ = 100000;
 
 static const float ACCEL_RANGE_G = 8.0f;
 static const float GYRO_RANGE_DPS = 2000.0f;
@@ -49,13 +58,13 @@ static const float GRAVITY = 9.80665f;
 
 static const uint32_t CAL_MAGIC = 0xCA1B1601;
 
-// ---------- Sensors ----------
-SparkFunBMI160 imu;
-SparkFunBMM150Aux mag;
-bool magReady = false;
+// ---------- State ----------
+uint8_t bmi160Addr = 0;
 bool calibrationMode = false;
+uint32_t lastSampleMs = 0;
+uint32_t readFailCount = 0;
+uint32_t zeroStreak = 0;
 
-// ---------- Calibration ----------
 struct CalProfile {
   uint32_t magic;
   float gyro_offset[3];
@@ -67,10 +76,6 @@ struct CalProfile {
 
 CalProfile cal;
 
-// ---------- Timing ----------
-uint32_t lastSampleMs = 0;
-
-// ---------- Forward declarations ----------
 void loadCalibration();
 void saveCalibration();
 void resetCalibrationDefaults();
@@ -80,6 +85,16 @@ void handleSerialCommand(String &line);
 void streamSample();
 float rawAccelToMS2(int16_t raw);
 float rawGyroToDPS(int16_t raw);
+void initI2C();
+void scanI2CBus();
+uint8_t findBmi160Address();
+bool readBmi160ChipId(uint8_t addr, uint8_t &chipId);
+bool bmiWrite8(uint8_t reg, uint8_t val);
+bool bmiReadBytes(uint8_t reg, uint8_t *buf, uint8_t len);
+bool bmi160Init();
+bool bmi160EnsureSensorsOn();
+bool bmi160ReadRaw(int16_t &gx, int16_t &gy, int16_t &gz, int16_t &ax, int16_t &ay, int16_t &az);
+bool accelHasGravity(int16_t ax, int16_t ay, int16_t az);
 
 void resetCalibrationDefaults() {
   cal.magic = CAL_MAGIC;
@@ -140,62 +155,229 @@ float rawGyroToDPS(int16_t raw) {
   return raw * GYRO_RANGE_DPS / 32768.0f;
 }
 
-void applyMagCorrection(float mx, float my, float mz, float &ox, float &oy, float &oz) {
-  float vx = mx - cal.mag_offset[0];
-  float vy = my - cal.mag_offset[1];
-  float vz = mz - cal.mag_offset[2];
-  ox = cal.mag_soft_iron[0][0] * vx + cal.mag_soft_iron[0][1] * vy + cal.mag_soft_iron[0][2] * vz;
-  oy = cal.mag_soft_iron[1][0] * vx + cal.mag_soft_iron[1][1] * vy + cal.mag_soft_iron[1][2] * vz;
-  oz = cal.mag_soft_iron[2][0] * vx + cal.mag_soft_iron[2][1] * vy + cal.mag_soft_iron[2][2] * vz;
+void initI2C() {
+#if defined(ESP32)
+  pinMode(21, INPUT_PULLUP);
+  pinMode(22, INPUT_PULLUP);
+  Wire.begin(21, 22);
+#else
+  Wire.begin();
+#endif
+  Wire.setClock(I2C_CLOCK_HZ);
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setTimeout(50);
+#endif
+  delay(50);
 }
 
-void streamSample() {
-  int16_t axRaw, ayRaw, azRaw;
-  int16_t gxRaw, gyRaw, gzRaw;
-  float mxRaw = 0.0f, myRaw = 0.0f, mzRaw = 0.0f;
+bool readBmi160ChipId(uint8_t addr, uint8_t &chipId) {
+  Wire.beginTransmission(addr);
+  Wire.write(REG_CHIP_ID);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(addr, (uint8_t)1) != 1) {
+    return false;
+  }
+  chipId = Wire.read();
+  return true;
+}
 
-  axRaw = imu.getRawAccelX();
-  ayRaw = imu.getRawAccelY();
-  azRaw = imu.getRawAccelZ();
-  gxRaw = imu.getRawGyroX();
-  gyRaw = imu.getRawGyroY();
-  gzRaw = imu.getRawGyroZ();
+uint8_t findBmi160Address() {
+  const uint8_t candidates[] = {0x68, 0x69};
+  for (uint8_t addr : candidates) {
+    uint8_t chipId = 0;
+    if (readBmi160ChipId(addr, chipId) && chipId == BMI160_CHIP_ID) {
+      return addr;
+    }
+  }
+  return 0;
+}
 
-  if (magReady) {
-    int16_t mxInt, myInt, mzInt;
-    if (mag.readMag(mxInt, myInt, mzInt)) {
-      // BMM150 aux output is typically in 0.3 µT/LSB for default settings
-      mxRaw = mxInt * 0.3f;
-      myRaw = myInt * 0.3f;
-      mzRaw = mzInt * 0.3f;
+void scanI2CBus() {
+  Serial.println("# I2C scan:");
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("#   0x");
+      if (addr < 16) {
+        Serial.print('0');
+      }
+      Serial.print(addr, HEX);
+      uint8_t chipId = 0;
+      if (readBmi160ChipId(addr, chipId)) {
+        Serial.print("  chip_id=0x");
+        Serial.print(chipId, HEX);
+      }
+      Serial.println();
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("#   (no devices)");
+  }
+}
+
+bool bmiWrite8(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(bmi160Addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+bool bmiReadBytes(uint8_t reg, uint8_t *buf, uint8_t len) {
+  Wire.beginTransmission(bmi160Addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  uint8_t received = Wire.requestFrom(bmi160Addr, len);
+  if (received == 0) {
+    return false;
+  }
+  uint8_t i = 0;
+  uint32_t start = millis();
+  while (i < len && millis() - start < 25) {
+    if (Wire.available()) {
+      buf[i++] = Wire.read();
+    }
+  }
+  return i == len;
+}
+
+bool bmi160EnsureSensorsOn() {
+  uint8_t pmu = 0;
+  if (!bmiReadBytes(REG_PMU_STATUS, &pmu, 1)) {
+    return false;
+  }
+
+  bool ok = true;
+  if ((pmu & 0x30) != 0x10) {
+    ok = bmiWrite8(REG_CMD, CMD_ACCEL_NORMAL) && ok;
+    delay(5);
+  }
+  if ((pmu & 0x0C) != 0x04) {
+    ok = bmiWrite8(REG_CMD, CMD_GYRO_NORMAL) && ok;
+    delay(5);
+  }
+  return ok;
+}
+
+bool accelHasGravity(int16_t ax, int16_t ay, int16_t az) {
+  // Stationary accel should never be exactly 0 on all axes (gravity).
+  return (ax != 0 || ay != 0 || az != 0);
+}
+
+bool bmi160Init() {
+  uint8_t dummy = 0;
+  bmiReadBytes(0x7F, &dummy, 1);
+
+  if (!bmiWrite8(REG_CMD, CMD_SOFT_RESET)) {
+    return false;
+  }
+  delay(100);
+
+  bmiWrite8(REG_PMU_TRIGGER, 0x00);
+  if (!bmiWrite8(REG_PWR_CONF, 0x00)) {
+    return false;
+  }
+  delay(20);
+
+  // Configure ranges/ODR before enabling sensors (Bosch recommended order).
+  if (!bmiWrite8(REG_ACC_CONF, 0x28)) {
+    return false;
+  }
+  if (!bmiWrite8(REG_ACC_RANGE, 0x08)) {
+    return false;  // +/- 8 g
+  }
+  if (!bmiWrite8(REG_GYR_CONF, 0x28)) {
+    return false;
+  }
+  if (!bmiWrite8(REG_GYR_RANGE, 0x00)) {
+    return false;  // +/- 2000 dps
+  }
+  delay(10);
+
+  if (!bmiWrite8(REG_CMD, CMD_ACCEL_NORMAL)) {
+    return false;
+  }
+  delay(50);
+  if (!bmiWrite8(REG_CMD, CMD_GYRO_NORMAL)) {
+    return false;
+  }
+  delay(100);
+
+  uint8_t pmu = 0;
+  if (bmiReadBytes(REG_PMU_STATUS, &pmu, 1)) {
+    Serial.print("# PMU status 0x");
+    Serial.println(pmu, HEX);
+  }
+  zeroStreak = 0;
+  return true;
+}
+
+bool bmi160ReadRaw(int16_t &gx, int16_t &gy, int16_t &gz, int16_t &ax, int16_t &ay, int16_t &az) {
+  bmi160EnsureSensorsOn();
+
+  uint8_t buf[12];
+  bool gotValid = false;
+
+  for (int attempt = 0; attempt < 5; attempt++) {
+    delay(12);
+    if (!bmiReadBytes(REG_GYR_DATA, buf, 12)) {
+      continue;
+    }
+
+    gx = (int16_t)((buf[1] << 8) | buf[0]);
+    gy = (int16_t)((buf[3] << 8) | buf[2]);
+    gz = (int16_t)((buf[5] << 8) | buf[4]);
+    ax = (int16_t)((buf[7] << 8) | buf[6]);
+    ay = (int16_t)((buf[9] << 8) | buf[8]);
+    az = (int16_t)((buf[11] << 8) | buf[10]);
+
+    if (accelHasGravity(ax, ay, az)) {
+      gotValid = true;
+      break;
     }
   }
 
-  float ax = rawAccelToMS2(axRaw);
-  float ay = rawAccelToMS2(ayRaw);
-  float az = rawAccelToMS2(azRaw);
-  float gx = rawGyroToDPS(gxRaw);
-  float gy = rawGyroToDPS(gyRaw);
-  float gz = rawGyroToDPS(gzRaw);
+  return gotValid;
+}
 
-  // Stream raw values — GUI applies calibration
-  Serial.print(ax, 4);
+void streamSample() {
+  int16_t axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw;
+  if (!bmi160ReadRaw(gxRaw, gyRaw, gzRaw, axRaw, ayRaw, azRaw)) {
+    zeroStreak++;
+    readFailCount++;
+    if (zeroStreak == 10) {
+      Serial.println("# WARN BMI160 stale data — reinitializing sensor");
+      bmi160Init();
+      zeroStreak = 0;
+    } else if (readFailCount == 1 || (readFailCount % 100) == 0) {
+      Serial.print("# WARN BMI160 read invalid (");
+      Serial.print(readFailCount);
+      Serial.println(")");
+    }
+    return;
+  }
+
+  readFailCount = 0;
+  zeroStreak = 0;
+
+  Serial.print(rawAccelToMS2(axRaw), 4);
   Serial.print(',');
-  Serial.print(ay, 4);
+  Serial.print(rawAccelToMS2(ayRaw), 4);
   Serial.print(',');
-  Serial.print(az, 4);
+  Serial.print(rawAccelToMS2(azRaw), 4);
   Serial.print(',');
-  Serial.print(gx, 4);
+  Serial.print(rawGyroToDPS(gxRaw), 4);
   Serial.print(',');
-  Serial.print(gy, 4);
+  Serial.print(rawGyroToDPS(gyRaw), 4);
   Serial.print(',');
-  Serial.print(gz, 4);
-  Serial.print(',');
-  Serial.print(mxRaw, 4);
-  Serial.print(',');
-  Serial.print(myRaw, 4);
-  Serial.print(',');
-  Serial.println(mzRaw, 4);
+  Serial.print(rawGyroToDPS(gzRaw), 4);
+  Serial.print(",0,0,0");
+  Serial.println();
 }
 
 void emitCalibrationJson() {
@@ -290,6 +472,9 @@ void handleSerialCommand(String &line) {
   if (line == "CAL_MODE_ON") {
     calibrationMode = true;
     lastSampleMs = 0;
+    readFailCount = 0;
+    zeroStreak = 0;
+    bmi160EnsureSensorsOn();
     Serial.println("CAL_MODE_ON");
     return;
   }
@@ -302,6 +487,11 @@ void handleSerialCommand(String &line) {
 
   if (line == "GET_CAL") {
     emitCalibrationJson();
+    return;
+  }
+
+  if (line == "I2C_SCAN") {
+    scanI2CBus();
     return;
   }
 
@@ -322,24 +512,51 @@ void setup() {
     delay(10);
   }
 
-  Wire.begin();
-  Wire.setClock(400000);
+  initI2C();
+  scanI2CBus();
 
-  if (imu.begin(BMI160SlaveSelect::BMI160_I2C_ADDR) != BMI160_OK) {
+  bmi160Addr = findBmi160Address();
+  if (!bmi160Addr) {
+    Serial.println("# ERR BMI160 not found at 0x68 or 0x69");
+    Serial.println("# Check: power LED, SDA/SCL not swapped, common GND");
+    Serial.println("# Some boards need 4.7k pull-ups on SDA/SCL if missing");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.print("# BMI160 found at 0x");
+  Serial.println(bmi160Addr, HEX);
+
+  if (!bmi160Init()) {
     Serial.println("# ERR BMI160 init failed");
     while (true) {
       delay(1000);
     }
   }
 
-  imu.setAccelRange(BMI160_ACCEL_RANGE_8G);
-  imu.setGyroRange(BMI160_GYRO_RANGE_2000_DPS);
-
-  if (mag.begin(BMI160SlaveSelect::BMI160_I2C_ADDR, imu) == BMM150_OK) {
-    magReady = true;
-  } else {
-    magReady = false;
-    Serial.println("# WARN BMM150 not found — mag values will be zero");
+  {
+    int16_t gx, gy, gz, ax, ay, az;
+    delay(100);
+    if (bmi160ReadRaw(gx, gy, gz, ax, ay, az)) {
+      Serial.print("# Test read  ax=");
+      Serial.print(ax);
+      Serial.print(" ay=");
+      Serial.print(ay);
+      Serial.print(" az=");
+      Serial.print(az);
+      Serial.print("  gx=");
+      Serial.print(gx);
+      Serial.print(" gy=");
+      Serial.print(gy);
+      Serial.print(" gz=");
+      Serial.println(gz);
+      if (ax == 0 && ay == 0 && az == 0) {
+        Serial.println("# WARN accel all zero — place board flat, then reset");
+      }
+    } else {
+      Serial.println("# WARN test read failed");
+    }
   }
 
   loadCalibration();

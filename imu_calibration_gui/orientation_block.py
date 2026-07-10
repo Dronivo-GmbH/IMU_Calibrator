@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 from matplotlib.axes import Axes
 from mpl_toolkits.mplot3d import art3d
 
 import viz_theme as theme
+from axis_conventions import tilt_from_accel
+
+__all__ = ["draw_orientation_block", "rotation_from_accel", "tilt_from_accel"]
 
 
 def _cube_corners(hx: float, hy: float, hz: float) -> np.ndarray:
@@ -41,21 +42,6 @@ def rotation_from_accel(ax: float, ay: float, az: float) -> np.ndarray:
     x /= x_norm
     y = np.cross(z, x)
     return np.column_stack([x, y, z])
-
-
-def tilt_from_accel(ax_m: float, ay_m: float, az_m: float) -> tuple[float, float]:
-    """
-    Roll and pitch in degrees from accelerometer tilt (gravity vector).
-
-    Convention: level with +Z up → roll ≈ 0°, pitch ≈ 0°.
-    Yaw is not observable from accel alone.
-    """
-    mag = float(np.hypot(ax_m, np.hypot(ay_m, az_m)))
-    if mag < 0.5:
-        return 0.0, 0.0
-    roll = math.degrees(math.atan2(ay_m, az_m))
-    pitch = math.degrees(math.atan2(ax_m, math.hypot(ay_m, az_m)))
-    return roll, pitch
 
 
 def draw_orientation_block(

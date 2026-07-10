@@ -14,7 +14,8 @@ from matplotlib.gridspec import GridSpec
 
 import viz_theme as theme
 from calibration import GRAVITY
-from orientation_block import draw_orientation_block, tilt_from_accel
+from orientation_block import draw_orientation_block
+from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
 
 DEFAULT_ELEV = 28
 DEFAULT_AZIM = -58
@@ -118,19 +119,25 @@ class IMUVisualizerWidget(tk.Frame):
         ).pack(side="left")
 
         tk.Label(
-            header, text="Calibrated + EMA filtered · m/s² · deg/s", bg=theme.BG, fg=theme.MUTED,
+            header, text="Calibrated + low-pass filtered · m/s² · deg/s", bg=theme.BG, fg=theme.MUTED,
             font=(theme.FONT, 10),
         ).pack(side="left", padx=(12, 0))
 
         self.roll_var = tk.StringVar(value="Roll  —")
         tk.Label(
-            header, textvariable=self.roll_var, bg=theme.BG, fg=theme.AXIS_X,
+            header, textvariable=self.roll_var, bg=theme.BG, fg=theme.AXIS_Y,
             font=(theme.FONT, 12, "bold"),
         ).pack(side="left", padx=(18, 0))
 
         self.pitch_var = tk.StringVar(value="Pitch  —")
         tk.Label(
-            header, textvariable=self.pitch_var, bg=theme.BG, fg=theme.AXIS_Y,
+            header, textvariable=self.pitch_var, bg=theme.BG, fg=theme.AXIS_Z,
+            font=(theme.FONT, 12, "bold"),
+        ).pack(side="left", padx=(14, 0))
+
+        self.yaw_var = tk.StringVar(value="Yaw rate  —")
+        tk.Label(
+            header, textvariable=self.yaw_var, bg=theme.BG, fg=theme.AXIS_X,
             font=(theme.FONT, 12, "bold"),
         ).pack(side="left", padx=(14, 0))
 
@@ -329,12 +336,15 @@ class IMUVisualizerWidget(tk.Frame):
         self.ax_mag.set_ylim(ymin - pad, ymax + pad)
 
         roll, pitch = self._update_orientation(float(ax[-1]), float(ay[-1]), float(az[-1]))
+        yaw_rate = yaw_rate_from_gyro(float(gx[-1]))
 
         self.roll_var.set(f"Roll  {roll:+.1f}°")
         self.pitch_var.set(f"Pitch  {pitch:+.1f}°")
+        self.yaw_var.set(f"Yaw rate  {yaw_rate:+.1f}°/s")
         self.stats_var.set(
             f"{len(self._samples)} samples  ·  "
             f"Roll {roll:+.1f}°  ·  Pitch {pitch:+.1f}°  ·  "
+            f"Yaw {yaw_rate:+.1f}°/s  ·  "
             f"|ω| {gyro_mag[-1]:.2f} °/s  ·  {self.window_seconds:.0f}s"
         )
 

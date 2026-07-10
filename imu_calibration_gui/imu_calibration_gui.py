@@ -33,8 +33,8 @@ from calibration import (
     save_bno055_profile,
 )
 from device_protocol import format_bno_write_profile_command, format_set_cal_command, parse_cal_response
-from filtering import EMA_PRESETS, FilterConfig, RuntimeEMAFilter, apply_runtime_filter
-from orientation_block import tilt_from_accel
+from filtering import LPF_PRESETS, FilterConfig, LowPassFilter, apply_runtime_filter
+from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
 from six_face_wizard import open_six_face_wizard
 from imu_visualizer import IMUVisualizerWidget
 from mag_plot import MagPlotWidget
@@ -123,8 +123,8 @@ class BMI160CalibrationApp:
         self._plot_sample_counter = 0
         self._port_scan_running = False
         self._stream_scale = StreamScale()
-        self._filter_config = FilterConfig(enabled=True, alpha=0.1)
-        self._accel_filter = RuntimeEMAFilter(alpha=self._filter_config.alpha)
+        self._filter_config = FilterConfig(enabled=True, cutoff_hz=5.0)
+        self._lowpass_filter = LowPassFilter(cutoff_hz=self._filter_config.cutoff_hz)
         self.logo_image: object | None = None
         self._bno_profile: dict | None = None
         self._bno_status: dict | None = None
@@ -288,7 +288,7 @@ class BMI160CalibrationApp:
         self.baud_entry.insert(0, "115200")
         self.baud_entry.grid(row=1, column=1, padx=(0, 8), pady=4, sticky="w")
 
-        ttk.Label(frame, text="IMU model (select before connect)").grid(row=0, column=2, sticky="w")
+        ttk.Label(frame, text="IMU model").grid(row=0, column=2, sticky="w")
         self.imu_model_combo = ttk.Combobox(
             frame,
             textvariable=self.imu_model_var,
@@ -338,25 +338,25 @@ class BMI160CalibrationApp:
         self.filter_enabled = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             filter_row,
-            text="EMA on accel + gyro",
+            text="Low-pass on accel + gyro",
             variable=self.filter_enabled,
             command=self._on_filter_settings_changed,
         ).pack(side="left", padx=(8, 12))
 
-        ttk.Label(filter_row, text="Alpha:", foreground=viz_theme.MUTED).pack(side="left")
-        self.filter_alpha_var = tk.StringVar(value=EMA_PRESETS[1][0])
-        self.filter_alpha_combo = ttk.Combobox(
+        ttk.Label(filter_row, text="Cutoff:", foreground=viz_theme.MUTED).pack(side="left")
+        self.filter_cutoff_var = tk.StringVar(value=LPF_PRESETS[1][0])
+        self.filter_cutoff_combo = ttk.Combobox(
             filter_row,
-            textvariable=self.filter_alpha_var,
-            values=[label for label, _ in EMA_PRESETS],
+            textvariable=self.filter_cutoff_var,
+            values=[label for label, _ in LPF_PRESETS],
             width=16,
             state="readonly",
         )
-        self.filter_alpha_combo.pack(side="left", padx=(4, 8))
-        self.filter_alpha_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_filter_settings_changed())
+        self.filter_cutoff_combo.pack(side="left", padx=(4, 8))
+        self.filter_cutoff_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_filter_settings_changed())
 
         ttk.Button(filter_row, text="Reset filter", command=self._reset_filter_state).pack(side="left", padx=4)
-        self.filter_status_var = tk.StringVar(value="Filter: EMA α=0.1 · accel + gyro")
+        self.filter_status_var = tk.StringVar(value="Filter: low-pass 5 Hz · accel + gyro")
         ttk.Label(filter_row, textvariable=self.filter_status_var, foreground=viz_theme.MUTED).pack(
             side="right", padx=4,
         )
@@ -371,8 +371,9 @@ class BMI160CalibrationApp:
         self.live_value_vars: dict[str, tk.StringVar] = {}
         for col, (title, key, color) in enumerate(
             (
-                ("Roll (°)", "roll", viz_theme.AXIS_X),
-                ("Pitch (°)", "pitch", viz_theme.AXIS_Y),
+                ("Roll (°)  Y+", "roll", viz_theme.AXIS_Y),
+                ("Pitch (°)  Z+", "pitch", viz_theme.AXIS_Z),
+                ("Yaw rate (°/s)  X+", "yaw", viz_theme.AXIS_X),
             )
         ):
             card = tk.Frame(
@@ -451,7 +452,7 @@ class BMI160CalibrationApp:
 
         ttk.Label(
             header,
-            text="Raw = LSB · Corrected = calibration only · Filtered = corrected + EMA",
+            text="Raw = LSB · Corrected = calibration only · Filtered = corrected + low-pass",
             foreground=viz_theme.MUTED,
         ).grid(row=1, column=0, sticky="w")
 
@@ -488,8 +489,8 @@ class BMI160CalibrationApp:
             ("acc_corr", "Accelerometer — Corrected"),
             ("gyro_corr", "Gyroscope — Corrected"),
             ("mag_corr", "Magnetometer — Corrected"),
-            ("acc_filt", "Accelerometer — Filtered (EMA)"),
-            ("gyro_filt", "Gyroscope — Filtered (EMA)"),
+            ("acc_filt", "Accelerometer — Filtered (LPF)"),
+            ("gyro_filt", "Gyroscope — Filtered (LPF)"),
             ("tilt_filt", "Tilt — Filtered (from accel)"),
         ):
             self._readout_row_ids[key] = self.readout_table.insert(
@@ -551,8 +552,8 @@ class BMI160CalibrationApp:
             ("acc_corr", "Accelerometer — Corrected", corrected, ("ax", "ay", "az"), False),
             ("gyro_corr", "Gyroscope — Corrected", corrected, ("gx", "gy", "gz"), False),
             ("mag_corr", "Magnetometer — Corrected", corrected, ("mx", "my", "mz"), False),
-            ("acc_filt", "Accelerometer — Filtered (EMA)", filtered, ("ax", "ay", "az"), False),
-            ("gyro_filt", "Gyroscope — Filtered (EMA)", filtered, ("gx", "gy", "gz"), False),
+            ("acc_filt", "Accelerometer — Filtered (LPF)", filtered, ("ax", "ay", "az"), False),
+            ("gyro_filt", "Gyroscope — Filtered (LPF)", filtered, ("gx", "gy", "gz"), False),
         ]
         for key, label, data, fields, is_raw in rows:
             if not data and key.endswith("_filt"):
@@ -565,9 +566,10 @@ class BMI160CalibrationApp:
 
         if filtered:
             roll, pitch = tilt_from_accel(filtered.get("ax", 0.0), filtered.get("ay", 0.0), filtered.get("az", 0.0))
+            yaw = yaw_rate_from_gyro(filtered.get("gx", 0.0))
             self.readout_table.item(
                 self._readout_row_ids["tilt_filt"],
-                values=("Tilt — Filtered (from accel)", f"{roll:+.2f}", f"{pitch:+.2f}", "—"),
+                values=("Tilt — Filtered", f"Roll {roll:+.2f}", f"Pitch {pitch:+.2f}", f"Yaw {yaw:+.2f} °/s"),
             )
 
     def _build_calibration_panel(self, parent: ttk.Frame) -> None:
@@ -809,7 +811,7 @@ class BMI160CalibrationApp:
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
         self._stream_scale = StreamScale()
-        self._accel_filter.reset()
+        self._lowpass_filter.reset()
         self.imu_visualizer.clear()
         self.imu_visualizer.set_running(self.notebook.index(self.notebook.select()) == 0)
         self.status_var.set(f"Connected to {port} at {baud} baud.")
@@ -852,32 +854,38 @@ class BMI160CalibrationApp:
         return normalize_samples(samples, self._stream_scale)
 
     def _sync_filter_config(self) -> None:
-        label = self.filter_alpha_var.get()
-        alpha = next((a for l, a in EMA_PRESETS if l == label), 0.1)
+        label = self.filter_cutoff_var.get()
+        cutoff_hz = next((hz for l, hz in LPF_PRESETS if l == label), 5.0)
         self._filter_config.enabled = self.filter_enabled.get()
-        self._filter_config.alpha = alpha
-        self._accel_filter.configure(alpha)
+        self._filter_config.cutoff_hz = cutoff_hz
+        self._lowpass_filter.configure(cutoff_hz)
 
     def _on_filter_settings_changed(self) -> None:
-        prev_alpha = self._filter_config.alpha
+        prev_cutoff = self._filter_config.cutoff_hz
         prev_enabled = self._filter_config.enabled
         self._sync_filter_config()
-        if self._filter_config.alpha != prev_alpha or self._filter_config.enabled != prev_enabled:
-            self._accel_filter.reset()
+        if self._filter_config.cutoff_hz != prev_cutoff or self._filter_config.enabled != prev_enabled:
+            self._lowpass_filter.reset()
         state = "on" if self._filter_config.enabled else "off"
-        self.filter_status_var.set(f"Filter: EMA α={self._filter_config.alpha} · accel + gyro · {state}")
+        self.filter_status_var.set(
+            f"Filter: low-pass {self._filter_config.cutoff_hz:g} Hz · accel + gyro · {state}"
+        )
 
     def _reset_filter_state(self) -> None:
-        self._accel_filter.reset()
+        self._lowpass_filter.reset()
         self.filter_status_var.set(
-            f"Filter: reset · EMA α={self._filter_config.alpha} · "
+            f"Filter: reset · low-pass {self._filter_config.cutoff_hz:g} Hz · "
             f"{'on' if self._filter_config.enabled else 'off'}"
         )
 
-    def _process_sample(self, data: dict[str, float]) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    def _process_sample(
+        self, data: dict[str, float], *, timestamp: float | None = None,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
         physical = self._normalize_data(data)
         corrected = apply_calibration(physical, self.store.data)
-        filtered = apply_runtime_filter(corrected, self._accel_filter, self._filter_config)
+        filtered = apply_runtime_filter(
+            corrected, self._lowpass_filter, self._filter_config, timestamp=timestamp,
+        )
         return physical, corrected, filtered
 
     def _on_sample(self, sample) -> None:
@@ -887,7 +895,7 @@ class BMI160CalibrationApp:
         def push_to_visualizer() -> None:
             if self.notebook.index(self.notebook.select()) != 0:
                 return
-            _, _, display = self._process_sample(sample.as_dict())
+            _, _, display = self._process_sample(sample.as_dict(), timestamp=sample.timestamp)
             self.imu_visualizer.add_sample(
                 sample.timestamp,
                 display["ax"], display["ay"], display["az"],
@@ -913,7 +921,7 @@ class BMI160CalibrationApp:
         sample = self.client.latest
         if sample:
             data = sample.as_dict()
-            physical, corrected, filtered = self._process_sample(data)
+            physical, corrected, filtered = self._process_sample(data, timestamp=sample.timestamp)
 
             self._last_readout["raw"] = data
             self._last_readout["corrected"] = corrected
@@ -930,6 +938,7 @@ class BMI160CalibrationApp:
             roll, pitch = tilt_from_accel(filtered["ax"], filtered["ay"], filtered["az"])
             self.live_value_vars["roll"].set(f"{roll:+.2f}")
             self.live_value_vars["pitch"].set(f"{pitch:+.2f}")
+            self.live_value_vars["yaw"].set(f"{yaw_rate_from_gyro(filtered['gx']):+.2f}")
 
             self.rate_var.set(f"Sample rate  {self.client.sample_rate_hz:.1f} Hz")
             self.total_var.set(f"Samples  {self.client.total_samples:,}")
