@@ -12,7 +12,7 @@ Desktop calibration tool for **BMI160** IMU boards (ESP32 / Arduino). Stream liv
 - **3D body orientation** — IMU block tilts from gravity (accel-based tilt)
 - **Calibration workflows** — gyro zero-rate, accel flat (+Z), six-face accel wizard, magnetometer figure-8
 - **Stored calibration** — offsets and scales saved to `~/.config/dronivo/bmi160_calibration.json`
-- **Runtime EMA filter** — smooth accel + gyro display (not saved to JSON; separate from calibration)
+- **Runtime low-pass filter** — smooth accel + gyro display (not saved to JSON; separate from calibration)
 - **Device sync** — `PING`, `GET_CAL`, `SET_CAL` over serial (SparkFun firmware)
 - **Export / import** — JSON calibration profiles
 
@@ -55,7 +55,7 @@ python imu_calibration_gui.py
 Calibration (saved) and filtering (runtime) are kept separate:
 
 ```text
-BMI160 → Raw serial → LSB → m/s² / °/s → Apply JSON calibration → EMA filter → Display
+BMI160 → Raw serial → LSB → m/s² / °/s → Apply JSON calibration → low-pass filter → Display
 ```
 
 **Saved to JSON**
@@ -64,7 +64,7 @@ BMI160 → Raw serial → LSB → m/s² / °/s → Apply JSON calibration → EM
 - `accel_offset` — m/s²  
 - `accel_scale` — unitless  
 
-**Not saved** — EMA filter state (resets each session)
+**Not saved** — low-pass filter state (resets each session)
 
 ### Suggested order
 
@@ -100,7 +100,7 @@ IMU_Calibrator/
 └── imu_calibration_gui/
     ├── imu_calibration_gui.py  # Main Tkinter app
     ├── calibration.py          # Cal math + JSON store
-    ├── filtering.py            # Runtime EMA (accel + gyro)
+    ├── filtering.py            # Runtime low-pass (accel + gyro)
     ├── sensor_units.py         # LSB → physical units
     ├── imu_visualizer.py       # Live charts + 3D block
     ├── six_face_wizard.py      # PX4-style six-face accel wizard

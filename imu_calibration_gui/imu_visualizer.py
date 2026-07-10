@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -14,8 +14,8 @@ from matplotlib.gridspec import GridSpec
 
 import viz_theme as theme
 from calibration import GRAVITY
+from level_reference import LEVEL_MIN_SAMPLES, LevelReference
 from orientation_block import draw_orientation_block
-from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
 
 DEFAULT_ELEV = 28
 DEFAULT_AZIM = -58
@@ -43,11 +43,21 @@ class IMUVisualizerWidget(tk.Frame):
     REFRESH_MS = 80
     IDLE_REFRESH_MS = 1000
 
-    def __init__(self, parent: tk.Misc, window_seconds: float = 10.0, max_samples: int = 1200):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        window_seconds: float = 10.0,
+        max_samples: int = 1200,
+        level_ref: LevelReference | None = None,
+        on_level_changed: Callable[[], None] | None = None,
+    ):
         super().__init__(parent, bg=theme.BG)
         self.window_seconds = window_seconds
         self.max_samples = max_samples
+        self.level_ref = level_ref or LevelReference()
+        self._on_level_changed = on_level_changed
         self._samples: deque[_Sample] = deque(maxlen=max_samples)
+        self._capture_buffer: deque[dict[str, float]] = deque(maxlen=50)
         self._t0: float | None = None
         self._refresh_job: str | None = None
         self._root = parent.winfo_toplevel()
@@ -58,6 +68,7 @@ class IMUVisualizerWidget(tk.Frame):
         self._dirty = False
         self._ref_g_line = None
 
+        self._build_level_bar()
         self._build_header()
 
         self.figure = Figure(figsize=(10.5, 6.8), dpi=100, facecolor=theme.BG)
@@ -102,12 +113,87 @@ class IMUVisualizerWidget(tk.Frame):
         self._draw_idle_state()
         self._schedule_refresh()
 
+    @property
+    def is_leveled(self) -> bool:
+        return self.level_ref.active
+
     def set_running(self, active: bool) -> None:
         self._running = active
         if active:
             self._dirty = True
         else:
             self._dirty = False
+
+    def _build_level_bar(self) -> None:
+        bar = tk.Frame(self, bg=theme.PANEL, highlightbackground=theme.BORDER, highlightthickness=1)
+        bar.pack(fill="x", padx=8, pady=(6, 4))
+
+        self.level_btn = tk.Button(
+            bar,
+            text="Level Your IMU",
+            command=self._on_level_button,
+            font=(theme.FONT, 11, "bold"),
+            bg="#16a34a",
+            fg="#ffffff",
+            activebackground="#15803d",
+            activeforeground="#ffffff",
+            relief="flat",
+            padx=16,
+            pady=6,
+            cursor="hand2",
+        )
+        self.level_btn.pack(side="left", padx=(10, 12), pady=8)
+
+        self.level_status_var = tk.StringVar(value=self.level_ref.status_message())
+        tk.Label(
+            bar,
+            textvariable=self.level_status_var,
+            bg=theme.PANEL,
+            fg=theme.TEXT,
+            font=(theme.FONT, 10),
+            wraplength=720,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
+
+    def _update_level_ui(self) -> None:
+        if self.level_ref.active:
+            self.level_btn.config(text="Stop level", bg="#dc2626", activebackground="#b91c1c")
+        else:
+            self.level_btn.config(text="Level Your IMU", bg="#16a34a", activebackground="#15803d")
+        self.level_status_var.set(self.level_ref.status_message())
+        if self._on_level_changed:
+            self._on_level_changed()
+
+    def _on_level_button(self) -> None:
+        if self.level_ref.active:
+            self.clear_level()
+            return
+
+        if len(self._capture_buffer) < LEVEL_MIN_SAMPLES:
+            self.level_status_var.set(
+                f"Hold IMU level and still — need {LEVEL_MIN_SAMPLES}+ samples "
+                f"({len(self._capture_buffer)} so far)…"
+            )
+            return
+
+        if not self.level_ref.capture(list(self._capture_buffer)):
+            self.level_status_var.set("Could not set level — keep IMU still and try again.")
+            return
+
+        self._samples.clear()
+        self._t0 = None
+        self._dirty = True
+        self._update_level_ui()
+
+    def clear_level(self) -> None:
+        self.level_ref.clear()
+        self._samples.clear()
+        self._capture_buffer.clear()
+        self._t0 = None
+        self._dirty = True
+        self._update_level_ui()
+        self._draw_idle_state()
+        self._redraw_canvas()
 
     def _build_header(self) -> None:
         header = tk.Frame(self, bg=theme.BG)
@@ -119,7 +205,7 @@ class IMUVisualizerWidget(tk.Frame):
         ).pack(side="left")
 
         tk.Label(
-            header, text="Calibrated + low-pass filtered · m/s² · deg/s", bg=theme.BG, fg=theme.MUTED,
+            header, text="Relative to level zero · m/s² · deg/s", bg=theme.BG, fg=theme.MUTED,
             font=(theme.FONT, 10),
         ).pack(side="left", padx=(12, 0))
 
@@ -174,10 +260,10 @@ class IMUVisualizerWidget(tk.Frame):
         self._refresh_loop()
 
     def _refresh_loop(self) -> None:
-        if self._running and self._samples:
+        if self._running and self._capture_buffer:
             self.refresh()
 
-        delay = self.REFRESH_MS if (self._running and self._samples) else self.IDLE_REFRESH_MS
+        delay = self.REFRESH_MS if (self._running and self._capture_buffer) else self.IDLE_REFRESH_MS
         self._refresh_job = self._root.after(delay, self._refresh_loop)
 
     def destroy(self) -> None:
@@ -196,9 +282,20 @@ class IMUVisualizerWidget(tk.Frame):
         ax: float, ay: float, az: float,
         gx: float, gy: float, gz: float,
     ) -> None:
+        raw = {"ax": ax, "ay": ay, "az": az, "gx": gx, "gy": gy, "gz": gz}
+        self._capture_buffer.append(raw)
+
+        if not self.level_ref.active:
+            return
+
+        rel = self.level_ref.relative(ax, ay, az, gx, gy, gz)
         if self._t0 is None:
             self._t0 = timestamp
-        self._samples.append(_Sample(timestamp - self._t0, ax, ay, az, gx, gy, gz))
+        self._samples.append(_Sample(
+            timestamp - self._t0,
+            rel["ax"], rel["ay"], rel["az"],
+            rel["gx"], rel["gy"], rel["gz"],
+        ))
         self._dirty = True
 
     def _style_2d_axis(self, ax, title: str, ylabel: str) -> None:
@@ -213,8 +310,8 @@ class IMUVisualizerWidget(tk.Frame):
             spine.set_linewidth(0.8)
 
     def _init_artists(self) -> None:
-        self._style_2d_axis(self.ax_accel, "Accelerometer", "Acceleration (m/s²)")
-        self._style_2d_axis(self.ax_gyro, "Gyroscope", "Angular rate (deg/s)")
+        self._style_2d_axis(self.ax_accel, "Accelerometer (Δ from level)", "Δ Acceleration (m/s²)")
+        self._style_2d_axis(self.ax_gyro, "Gyroscope (Δ from level)", "Δ Angular rate (deg/s)")
         self._style_2d_axis(self.ax_mag, "Signal magnitude", "Magnitude")
 
         self._accel_lines = [
@@ -226,12 +323,10 @@ class IMUVisualizerWidget(tk.Frame):
             for c, l in zip(theme.CHANNEL_COLORS, ("X", "Y", "Z"))
         ]
         self._mag_lines = [
-            self.ax_mag.plot([], [], color=theme.ACCEL_MAG, linewidth=2.0, label="|a| (m/s²)", alpha=0.9)[0],
-            self.ax_mag.plot([], [], color=theme.GYRO_MAG, linewidth=2.0, label="|ω| (deg/s)", alpha=0.9)[0],
+            self.ax_mag.plot([], [], color=theme.ACCEL_MAG, linewidth=2.0, label="|Δa|", alpha=0.9)[0],
+            self.ax_mag.plot([], [], color=theme.GYRO_MAG, linewidth=2.0, label="|Δω|", alpha=0.9)[0],
         ]
-        self._ref_g_line = self.ax_mag.axhline(
-            GRAVITY, color=theme.MUTED, linewidth=1.0, linestyle="--", alpha=0.7, label="1 g",
-        )
+        self.ax_mag.axhline(0.0, color=theme.MUTED, linewidth=1.0, linestyle="--", alpha=0.7, label="0")
         self.ax_mag.axhline(0.0, color=theme.GRID, linewidth=0.8, alpha=0.8)
 
         for ax, lines in ((self.ax_accel, self._accel_lines), (self.ax_gyro, self._gyro_lines)):
@@ -246,7 +341,7 @@ class IMUVisualizerWidget(tk.Frame):
         )
 
         self._idle_text = self.figure.text(
-            0.5, 0.5, "Connect serial port to begin streaming",
+            0.5, 0.5, "Place IMU level and click  Level Your IMU",
             ha="center", va="center", fontsize=11, color=theme.MUTED, alpha=0.85,
         )
         self._initialized = True
@@ -254,16 +349,31 @@ class IMUVisualizerWidget(tk.Frame):
     def _reset_3d_view(self) -> None:
         if self._samples:
             last = self._samples[-1]
-            draw_orientation_block(
-                self.ax_orientation, last.ax, last.ay, last.az,
-                elev=self._default_elev, azim=self._default_azim,
-            )
+            self._draw_orientation_block_relative(last.ax, last.ay, last.az)
         else:
             draw_orientation_block(
                 self.ax_orientation, 0.0, 0.0, GRAVITY,
                 elev=self._default_elev, azim=self._default_azim,
+                roll_deg=0.0, pitch_deg=0.0,
             )
         self._redraw_canvas()
+
+    def _draw_orientation_block_relative(
+        self, rax: float, ray: float, raz: float, *, roll_deg: float = 0.0, pitch_deg: float = 0.0,
+    ) -> None:
+        elev = self.ax_orientation.elev
+        azim = self.ax_orientation.azim
+        mag = float(np.hypot(rax, np.hypot(ray, raz)))
+        if mag < 0.5:
+            draw_orientation_block(
+                self.ax_orientation, 0.0, 0.0, GRAVITY,
+                elev=elev, azim=azim, roll_deg=roll_deg, pitch_deg=pitch_deg,
+            )
+            return
+        draw_orientation_block(
+            self.ax_orientation, rax, ray, raz,
+            elev=elev, azim=azim, roll_deg=roll_deg, pitch_deg=pitch_deg,
+        )
 
     def _redraw_canvas(self) -> None:
         try:
@@ -271,20 +381,15 @@ class IMUVisualizerWidget(tk.Frame):
         except tk.TclError:
             pass
 
-    def _update_orientation(self, ax: float, ay: float, az: float) -> tuple[float, float]:
-        elev = self.ax_orientation.elev
-        azim = self.ax_orientation.azim
-        roll, pitch = tilt_from_accel(ax, ay, az)
-        draw_orientation_block(
-            self.ax_orientation, ax, ay, az,
-            elev=elev, azim=azim, roll_deg=roll, pitch_deg=pitch,
-        )
-        return roll, pitch
-
     def _draw_idle_state(self) -> None:
         if not self._initialized:
             return
-        self._idle_text.set_alpha(0.85 if not self._samples else 0.0)
+        show_overlay = not self.level_ref.active or not self._samples
+        self._idle_text.set_alpha(0.85 if show_overlay else 0.0)
+        if not self.level_ref.active:
+            self._idle_text.set_text("Place IMU level and click  Level Your IMU")
+        elif not self._samples:
+            self._idle_text.set_text("Level set — waiting for samples…")
 
     @staticmethod
     def _smooth_ylim(data: np.ndarray, pad: float = 0.15, min_span: float = 1.0) -> tuple[float, float]:
@@ -308,7 +413,19 @@ class IMUVisualizerWidget(tk.Frame):
         ax.set_ylim(ymin, ymax)
 
     def refresh(self) -> None:
-        if not self._initialized or not self._running or not self._samples:
+        if not self._initialized or not self._running:
+            return
+
+        if not self.level_ref.active or not self._samples:
+            self.roll_var.set("Roll  —")
+            self.pitch_var.set("Pitch  —")
+            self.yaw_var.set("Yaw rate  —")
+            if self._capture_buffer:
+                self.stats_var.set(
+                    f"Buffering {len(self._capture_buffer)} samples — level IMU to start plots"
+                )
+            self._draw_idle_state()
+            self._redraw_canvas()
             return
 
         self._idle_text.set_alpha(0.0)
@@ -321,8 +438,8 @@ class IMUVisualizerWidget(tk.Frame):
         ax, ay, az = arr[mask, 1], arr[mask, 2], arr[mask, 3]
         gx, gy, gz = arr[mask, 4], arr[mask, 5], arr[mask, 6]
 
-        self._update_2d_panel(self.ax_accel, self._accel_lines, t, (ax, ay, az), min_span=2.0)
-        self._update_2d_panel(self.ax_gyro, self._gyro_lines, t, (gx, gy, gz), min_span=1.0)
+        self._update_2d_panel(self.ax_accel, self._accel_lines, t, (ax, ay, az), min_span=0.5)
+        self._update_2d_panel(self.ax_gyro, self._gyro_lines, t, (gx, gy, gz), min_span=0.5)
 
         accel_mag = np.sqrt(ax ** 2 + ay ** 2 + az ** 2)
         gyro_mag = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
@@ -331,21 +448,27 @@ class IMUVisualizerWidget(tk.Frame):
         if len(t) >= 2:
             self.ax_mag.set_xlim(float(t[0]), float(t[-1]))
         ymin = min(float(np.min(accel_mag)), float(np.min(gyro_mag)), 0.0)
-        ymax = max(float(np.max(accel_mag)), float(np.max(gyro_mag)), GRAVITY * 1.2)
-        pad = (ymax - ymin) * 0.12 if ymax > ymin else 1.0
+        ymax = max(float(np.max(accel_mag)), float(np.max(gyro_mag)), 1.0)
+        pad = (ymax - ymin) * 0.12 if ymax > ymin else 0.5
         self.ax_mag.set_ylim(ymin - pad, ymax + pad)
 
-        roll, pitch = self._update_orientation(float(ax[-1]), float(ay[-1]), float(az[-1]))
-        yaw_rate = yaw_rate_from_gyro(float(gx[-1]))
+        last_raw = self._capture_buffer[-1]
+        rel = self.level_ref.relative(
+            last_raw["ax"], last_raw["ay"], last_raw["az"],
+            last_raw["gx"], last_raw["gy"], last_raw["gz"],
+        )
+        self._draw_orientation_block_relative(
+            rel["ax"], rel["ay"], rel["az"], roll_deg=rel["roll"], pitch_deg=rel["pitch"],
+        )
 
-        self.roll_var.set(f"Roll  {roll:+.1f}°")
-        self.pitch_var.set(f"Pitch  {pitch:+.1f}°")
-        self.yaw_var.set(f"Yaw rate  {yaw_rate:+.1f}°/s")
+        self.roll_var.set(f"Roll  {rel['roll']:+.1f}°")
+        self.pitch_var.set(f"Pitch  {rel['pitch']:+.1f}°")
+        self.yaw_var.set(f"Yaw rate  {rel['yaw']:+.1f}°/s")
         self.stats_var.set(
             f"{len(self._samples)} samples  ·  "
-            f"Roll {roll:+.1f}°  ·  Pitch {pitch:+.1f}°  ·  "
-            f"Yaw {yaw_rate:+.1f}°/s  ·  "
-            f"|ω| {gyro_mag[-1]:.2f} °/s  ·  {self.window_seconds:.0f}s"
+            f"Roll {rel['roll']:+.1f}°  ·  Pitch {rel['pitch']:+.1f}°  ·  "
+            f"Yaw {rel['yaw']:+.1f}°/s  ·  "
+            f"|Δω| {gyro_mag[-1]:.2f} °/s  ·  {self.window_seconds:.0f}s"
         )
 
         self._redraw_canvas()

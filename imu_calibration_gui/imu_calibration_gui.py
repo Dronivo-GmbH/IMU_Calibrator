@@ -34,9 +34,9 @@ from calibration import (
 )
 from device_protocol import format_bno_write_profile_command, format_set_cal_command, parse_cal_response
 from filtering import LPF_PRESETS, FilterConfig, LowPassFilter, apply_runtime_filter
-from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
 from six_face_wizard import open_six_face_wizard
 from imu_visualizer import IMUVisualizerWidget
+from level_reference import LevelReference
 from mag_plot import MagPlotWidget
 from serial_client import SerialIMUClient, list_serial_ports
 from sensor_units import StreamScale, normalize_sample, normalize_samples
@@ -125,6 +125,7 @@ class BMI160CalibrationApp:
         self._stream_scale = StreamScale()
         self._filter_config = FilterConfig(enabled=True, cutoff_hz=5.0)
         self._lowpass_filter = LowPassFilter(cutoff_hz=self._filter_config.cutoff_hz)
+        self._level_ref = LevelReference()
         self.logo_image: object | None = None
         self._bno_profile: dict | None = None
         self._bno_status: dict | None = None
@@ -334,7 +335,7 @@ class BMI160CalibrationApp:
         filter_row = ttk.Frame(frame)
         filter_row.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(8, 0))
 
-        ttk.Label(filter_row, text="Runtime filter:", font=(viz_theme.FONT, 9, "bold")).pack(side="left")
+        ttk.Label(filter_row, text="Low-pass filter:", font=(viz_theme.FONT, 9, "bold")).pack(side="left")
         self.filter_enabled = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             filter_row,
@@ -362,7 +363,11 @@ class BMI160CalibrationApp:
         )
 
     def _build_live_view_tab(self, parent: ttk.Frame) -> None:
-        self.imu_visualizer = IMUVisualizerWidget(parent)
+        self.imu_visualizer = IMUVisualizerWidget(
+            parent,
+            level_ref=self._level_ref,
+            on_level_changed=self._on_level_reference_changed,
+        )
         self.imu_visualizer.pack(fill="both", expand=True)
 
         tilt_row = ttk.Frame(parent)
@@ -419,6 +424,10 @@ class BMI160CalibrationApp:
 
         footer = ttk.Frame(parent)
         footer.pack(fill="x", pady=(8, 0))
+        self.level_footer_var = tk.StringVar(value=self._level_ref.status_message())
+        ttk.Label(footer, textvariable=self.level_footer_var, foreground=viz_theme.MUTED).pack(
+            side="left", padx=(4, 24),
+        )
         self.rate_var = tk.StringVar(value="Sample rate  —")
         self.total_var = tk.StringVar(value="Samples  0")
         ttk.Label(footer, textvariable=self.rate_var, foreground=viz_theme.MUTED).pack(side="left", padx=(4, 24))
@@ -489,8 +498,8 @@ class BMI160CalibrationApp:
             ("acc_corr", "Accelerometer — Corrected"),
             ("gyro_corr", "Gyroscope — Corrected"),
             ("mag_corr", "Magnetometer — Corrected"),
-            ("acc_filt", "Accelerometer — Filtered (LPF)"),
-            ("gyro_filt", "Gyroscope — Filtered (LPF)"),
+            ("acc_filt", "Accelerometer — low-pass"),
+            ("gyro_filt", "Gyroscope — low-pass"),
             ("tilt_filt", "Tilt — Filtered (from accel)"),
         ):
             self._readout_row_ids[key] = self.readout_table.insert(
@@ -552,8 +561,8 @@ class BMI160CalibrationApp:
             ("acc_corr", "Accelerometer — Corrected", corrected, ("ax", "ay", "az"), False),
             ("gyro_corr", "Gyroscope — Corrected", corrected, ("gx", "gy", "gz"), False),
             ("mag_corr", "Magnetometer — Corrected", corrected, ("mx", "my", "mz"), False),
-            ("acc_filt", "Accelerometer — Filtered (LPF)", filtered, ("ax", "ay", "az"), False),
-            ("gyro_filt", "Gyroscope — Filtered (LPF)", filtered, ("gx", "gy", "gz"), False),
+            ("acc_filt", "Accelerometer — low-pass", filtered, ("ax", "ay", "az"), False),
+            ("gyro_filt", "Gyroscope — low-pass", filtered, ("gx", "gy", "gz"), False),
         ]
         for key, label, data, fields, is_raw in rows:
             if not data and key.endswith("_filt"):
@@ -565,12 +574,25 @@ class BMI160CalibrationApp:
             self.readout_table.item(self._readout_row_ids[key], values=(label, *values))
 
         if filtered:
-            roll, pitch = tilt_from_accel(filtered.get("ax", 0.0), filtered.get("ay", 0.0), filtered.get("az", 0.0))
-            yaw = yaw_rate_from_gyro(filtered.get("gx", 0.0))
-            self.readout_table.item(
-                self._readout_row_ids["tilt_filt"],
-                values=("Tilt — Filtered", f"Roll {roll:+.2f}", f"Pitch {pitch:+.2f}", f"Yaw {yaw:+.2f} °/s"),
-            )
+            if self._level_ref.active:
+                rel = self._level_ref.relative(
+                    filtered.get("ax", 0.0), filtered.get("ay", 0.0), filtered.get("az", 0.0),
+                    filtered.get("gx", 0.0), filtered.get("gy", 0.0), filtered.get("gz", 0.0),
+                )
+                self.readout_table.item(
+                    self._readout_row_ids["tilt_filt"],
+                    values=(
+                        "Tilt — vs level",
+                        f"Roll {rel['roll']:+.2f}",
+                        f"Pitch {rel['pitch']:+.2f}",
+                        f"Yaw {rel['yaw']:+.2f} °/s",
+                    ),
+                )
+            else:
+                self.readout_table.item(
+                    self._readout_row_ids["tilt_filt"],
+                    values=("Tilt — vs level", "Level IMU first", "—", "—"),
+                )
 
     def _build_calibration_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Calibration Workflows", padding=12, style="Section.TLabelframe")
@@ -812,6 +834,7 @@ class BMI160CalibrationApp:
         self._apply_mode_button_states()
         self._stream_scale = StreamScale()
         self._lowpass_filter.reset()
+        self.imu_visualizer.clear_level()
         self.imu_visualizer.clear()
         self.imu_visualizer.set_running(self.notebook.index(self.notebook.select()) == 0)
         self.status_var.set(f"Connected to {port} at {baud} baud.")
@@ -841,6 +864,7 @@ class BMI160CalibrationApp:
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
         self.imu_visualizer.set_running(False)
+        self.imu_visualizer.clear_level()
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
 
@@ -852,6 +876,10 @@ class BMI160CalibrationApp:
 
     def _normalize_samples(self, samples: list[dict[str, float]]) -> list[dict[str, float]]:
         return normalize_samples(samples, self._stream_scale)
+
+    def _on_level_reference_changed(self) -> None:
+        if hasattr(self, "level_footer_var"):
+            self.level_footer_var.set(self._level_ref.status_message())
 
     def _sync_filter_config(self) -> None:
         label = self.filter_cutoff_var.get()
@@ -935,10 +963,18 @@ class BMI160CalibrationApp:
             self.live_value_vars["gy"].set(f"{filtered['gy']:+.3f}")
             self.live_value_vars["gz"].set(f"{filtered['gz']:+.3f}")
 
-            roll, pitch = tilt_from_accel(filtered["ax"], filtered["ay"], filtered["az"])
-            self.live_value_vars["roll"].set(f"{roll:+.2f}")
-            self.live_value_vars["pitch"].set(f"{pitch:+.2f}")
-            self.live_value_vars["yaw"].set(f"{yaw_rate_from_gyro(filtered['gx']):+.2f}")
+            if self._level_ref.active:
+                rel = self._level_ref.relative(
+                    filtered["ax"], filtered["ay"], filtered["az"],
+                    filtered["gx"], filtered["gy"], filtered["gz"],
+                )
+                self.live_value_vars["roll"].set(f"{rel['roll']:+.2f}")
+                self.live_value_vars["pitch"].set(f"{rel['pitch']:+.2f}")
+                self.live_value_vars["yaw"].set(f"{rel['yaw']:+.2f}")
+            else:
+                self.live_value_vars["roll"].set("level first")
+                self.live_value_vars["pitch"].set("level first")
+                self.live_value_vars["yaw"].set("level first")
 
             self.rate_var.set(f"Sample rate  {self.client.sample_rate_hz:.1f} Hz")
             self.total_var.set(f"Samples  {self.client.total_samples:,}")
