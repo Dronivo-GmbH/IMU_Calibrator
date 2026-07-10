@@ -27,6 +27,7 @@ from calibration import (
     calibrate_mag_hard_iron,
     default_calibration_store_path,
     default_export_filename,
+    export_filename_pattern,
     extract_bmi160_calibration,
     infer_imu_model_from_payload,
     load_bno055_profile,
@@ -729,7 +730,7 @@ class BMI160CalibrationApp:
 
     def _update_model_profile_label(self) -> None:
         model_id = self._current_model_id()
-        export_name = default_export_filename(self.imu_model_var.get())
+        export_name = export_filename_pattern(self.imu_model_var.get())
         if self._is_bno055_mode():
             store_path = default_calibration_store_path(self.imu_model_var.get())
             self.model_profile_var.set(
@@ -781,7 +782,7 @@ class BMI160CalibrationApp:
             self.mag_btn.config(text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
             self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
             self.model_workflow_note.set(
-                "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160.json."
+                "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160_YYYYMMDD_HHMMSS.json."
             )
             if not self.client.is_connected:
                 self.status_var.set("Select BMI160, connect your board, turn ON calibration mode, then run workflows.")

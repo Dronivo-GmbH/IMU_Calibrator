@@ -39,9 +39,16 @@ def default_calibration_store_path(model_label: str) -> Path:
     return Path.home() / ".config" / "dronivo" / f"{slug}_calibration.json"
 
 
+def export_filename_pattern(model_label: str) -> str:
+    """Example export name shown in the UI (timestamp filled in at export time)."""
+    slug = imu_model_store_slug(model_label)
+    return f"IMU_Calibration_{slug.upper()}_YYYYMMDD_HHMMSS.json"
+
+
 def default_export_filename(model_label: str) -> str:
     slug = imu_model_store_slug(model_label)
-    return f"IMU_Calibration_{slug.upper()}.json"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"IMU_Calibration_{slug.upper()}_{timestamp}.json"
 
 
 def infer_imu_model_from_payload(payload: dict[str, Any]) -> str:
