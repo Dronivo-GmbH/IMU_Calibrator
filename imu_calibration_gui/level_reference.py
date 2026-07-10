@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
+import numpy as np
 
-LEVEL_AVERAGE_COUNT = 25
-LEVEL_MIN_SAMPLES = 8
+from axis_conventions import tilt_from_accel, yaw_rate_from_gyro
+from orientation_block import relative_rotation_from_level
+
+LEVEL_CAPTURE_SECONDS = 30.0
+LEVEL_MIN_SAMPLES = 50
 
 
 @dataclass
@@ -21,31 +24,44 @@ class LevelReference:
     gx: float = 0.0
     gy: float = 0.0
     gz: float = 0.0
-    roll: float = 0.0
-    pitch: float = 0.0
 
     def clear(self) -> None:
         self.active = False
         self.ax = self.ay = self.az = 0.0
         self.gx = self.gy = self.gz = 0.0
-        self.roll = self.pitch = 0.0
 
     def capture(self, samples: list[dict[str, float]]) -> bool:
-        """Average recent samples as the level zero. Returns False if too few samples."""
+        """Average samples as the level zero. Returns False if too few samples."""
         if len(samples) < LEVEL_MIN_SAMPLES:
             return False
 
-        use = samples[-LEVEL_AVERAGE_COUNT:]
-        n = len(use)
-        self.ax = sum(s["ax"] for s in use) / n
-        self.ay = sum(s["ay"] for s in use) / n
-        self.az = sum(s["az"] for s in use) / n
-        self.gx = sum(s["gx"] for s in use) / n
-        self.gy = sum(s["gy"] for s in use) / n
-        self.gz = sum(s["gz"] for s in use) / n
-        self.roll, self.pitch = tilt_from_accel(self.ax, self.ay, self.az)
+        n = len(samples)
+        self.ax = sum(s["ax"] for s in samples) / n
+        self.ay = sum(s["ay"] for s in samples) / n
+        self.az = sum(s["az"] for s in samples) / n
+        self.gx = sum(s["gx"] for s in samples) / n
+        self.gy = sum(s["gy"] for s in samples) / n
+        self.gz = sum(s["gz"] for s in samples) / n
         self.active = True
         return True
+
+    def relative_rotation(
+        self, ax: float, ay: float, az: float,
+    ) -> np.ndarray:
+        if not self.active:
+            return np.eye(3)
+        return relative_rotation_from_level(ax, ay, az, self.ax, self.ay, self.az)
+
+    def relative_tilt(self, ax: float, ay: float, az: float) -> tuple[float, float]:
+        """Roll/pitch in degrees relative to the captured level pose."""
+        if not self.active:
+            return 0.0, 0.0
+        d_rot = self.relative_rotation(ax, ay, az)
+        z_in_ref = d_rot @ np.array([0.0, 0.0, 1.0])
+        mag = float(np.linalg.norm([ax, ay, az]))
+        if mag < 0.5:
+            mag = 9.80665
+        return tilt_from_accel(z_in_ref[0] * mag, z_in_ref[1] * mag, z_in_ref[2] * mag)
 
     def relative(
         self, ax: float, ay: float, az: float, gx: float, gy: float, gz: float,
@@ -58,21 +74,22 @@ class LevelReference:
                 "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
             }
 
-        rax, ray, raz = ax - self.ax, ay - self.ay, az - self.az
-        rgx, rgy, rgz = gx - self.gx, gy - self.gy, gz - self.gz
-        roll, pitch = tilt_from_accel(ax, ay, az)
+        roll, pitch = self.relative_tilt(ax, ay, az)
         return {
-            "ax": rax, "ay": ray, "az": raz,
-            "gx": rgx, "gy": rgy, "gz": rgz,
-            "roll": roll - self.roll,
-            "pitch": pitch - self.pitch,
-            "yaw": yaw_rate_from_gyro(rgx),
+            "ax": ax - self.ax,
+            "ay": ay - self.ay,
+            "az": az - self.az,
+            "gx": gx - self.gx,
+            "gy": gy - self.gy,
+            "gz": gz - self.gz,
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw_rate_from_gyro(gx - self.gx),
         }
 
-    def status_message(self) -> str:
+    def status_message(self, *, capturing: bool = False, seconds_left: float | None = None) -> str:
+        if capturing and seconds_left is not None:
+            return f"Hold IMU level and still… capturing zero  ·  {seconds_left:.0f}s left"
         if not self.active:
-            return "Place IMU level, hold still, then click Level Your IMU"
-        return (
-            f"Leveled — zero set  ·  ref roll {self.roll:+.1f}° pitch {self.pitch:+.1f}°  "
-            f"·  click Stop level to reset"
-        )
+            return "Place IMU level, hold still, then click Level Your IMU (30 s capture)"
+        return "Ready — plotting relative to level zero  ·  click Stop level to reset"

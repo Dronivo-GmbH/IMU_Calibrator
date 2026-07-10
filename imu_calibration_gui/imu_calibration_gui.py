@@ -921,14 +921,14 @@ class BMI160CalibrationApp:
             return
 
         def push_to_visualizer() -> None:
-            if self.notebook.index(self.notebook.select()) != 0:
-                return
             _, _, display = self._process_sample(sample.as_dict(), timestamp=sample.timestamp)
             self.imu_visualizer.add_sample(
                 sample.timestamp,
                 display["ax"], display["ay"], display["az"],
                 display["gx"], display["gy"], display["gz"],
             )
+            if self.notebook.index(self.notebook.select()) == 0:
+                self.imu_visualizer.set_running(True)
 
         self.root.after(0, push_to_visualizer)
 
@@ -971,6 +971,10 @@ class BMI160CalibrationApp:
                 self.live_value_vars["roll"].set(f"{rel['roll']:+.2f}")
                 self.live_value_vars["pitch"].set(f"{rel['pitch']:+.2f}")
                 self.live_value_vars["yaw"].set(f"{rel['yaw']:+.2f}")
+            elif self.imu_visualizer.is_capturing_level:
+                self.live_value_vars["roll"].set("capturing…")
+                self.live_value_vars["pitch"].set("capturing…")
+                self.live_value_vars["yaw"].set("capturing…")
             else:
                 self.live_value_vars["roll"].set("level first")
                 self.live_value_vars["pitch"].set("level first")

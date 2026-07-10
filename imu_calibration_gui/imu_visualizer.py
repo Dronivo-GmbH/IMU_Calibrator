@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass
@@ -13,9 +14,8 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
 import viz_theme as theme
-from calibration import GRAVITY
-from level_reference import LEVEL_MIN_SAMPLES, LevelReference
-from orientation_block import draw_orientation_block
+from level_reference import LEVEL_CAPTURE_SECONDS, LEVEL_MIN_SAMPLES, LevelReference
+from orientation_block import draw_orientation_block, draw_orientation_block_relative
 
 DEFAULT_ELEV = 28
 DEFAULT_AZIM = -58
@@ -57,7 +57,11 @@ class IMUVisualizerWidget(tk.Frame):
         self.level_ref = level_ref or LevelReference()
         self._on_level_changed = on_level_changed
         self._samples: deque[_Sample] = deque(maxlen=max_samples)
-        self._capture_buffer: deque[dict[str, float]] = deque(maxlen=50)
+        self._capture_buffer: deque[dict[str, float]] = deque(maxlen=4000)
+        self._level_capturing = False
+        self._level_capture_samples: list[dict[str, float]] = []
+        self._level_capture_start: float = 0.0
+        self._level_capture_job: str | None = None
         self._t0: float | None = None
         self._refresh_job: str | None = None
         self._root = parent.winfo_toplevel()
@@ -117,6 +121,10 @@ class IMUVisualizerWidget(tk.Frame):
     def is_leveled(self) -> bool:
         return self.level_ref.active
 
+    @property
+    def is_capturing_level(self) -> bool:
+        return self._level_capturing
+
     def set_running(self, active: bool) -> None:
         self._running = active
         if active:
@@ -155,12 +163,21 @@ class IMUVisualizerWidget(tk.Frame):
             justify="left",
         ).pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
 
-    def _update_level_ui(self) -> None:
-        if self.level_ref.active:
-            self.level_btn.config(text="Stop level", bg="#dc2626", activebackground="#b91c1c")
+    def _update_level_ui(self, *, seconds_left: float | None = None) -> None:
+        if self._level_capturing:
+            self.level_btn.config(
+                text="Capturing…", bg="#ca8a04", activebackground="#a16207", state="disabled",
+            )
+        elif self.level_ref.active:
+            self.level_btn.config(text="Stop level", bg="#dc2626", activebackground="#b91c1c", state="normal")
         else:
-            self.level_btn.config(text="Level Your IMU", bg="#16a34a", activebackground="#15803d")
-        self.level_status_var.set(self.level_ref.status_message())
+            self.level_btn.config(text="Level Your IMU", bg="#16a34a", activebackground="#15803d", state="normal")
+        self.level_status_var.set(
+            self.level_ref.status_message(
+                capturing=self._level_capturing,
+                seconds_left=seconds_left,
+            )
+        )
         if self._on_level_changed:
             self._on_level_changed()
 
@@ -168,25 +185,66 @@ class IMUVisualizerWidget(tk.Frame):
         if self.level_ref.active:
             self.clear_level()
             return
+        if self._level_capturing:
+            return
+        self._start_level_capture()
 
-        if len(self._capture_buffer) < LEVEL_MIN_SAMPLES:
+    def _start_level_capture(self) -> None:
+        self._level_capturing = True
+        self._level_capture_samples = []
+        self._level_capture_start = time.time()
+        self._samples.clear()
+        self._t0 = None
+        self._update_level_ui(seconds_left=LEVEL_CAPTURE_SECONDS)
+        self._schedule_level_capture_tick()
+
+    def _schedule_level_capture_tick(self) -> None:
+        if self._level_capture_job:
+            self._root.after_cancel(self._level_capture_job)
+
+        elapsed = time.time() - self._level_capture_start
+        remaining = LEVEL_CAPTURE_SECONDS - elapsed
+
+        if remaining <= 0:
+            self._finish_level_capture()
+            return
+
+        self._update_level_ui(seconds_left=remaining)
+        self._level_capture_job = self._root.after(200, self._schedule_level_capture_tick)
+
+    def _finish_level_capture(self) -> None:
+        self._level_capturing = False
+        if self._level_capture_job:
+            self._root.after_cancel(self._level_capture_job)
+            self._level_capture_job = None
+
+        if len(self._level_capture_samples) < LEVEL_MIN_SAMPLES:
+            self._update_level_ui()
             self.level_status_var.set(
-                f"Hold IMU level and still — need {LEVEL_MIN_SAMPLES}+ samples "
-                f"({len(self._capture_buffer)} so far)…"
+                f"Too few samples ({len(self._level_capture_samples)}) — "
+                "check connection, hold IMU still, and try again."
             )
             return
 
-        if not self.level_ref.capture(list(self._capture_buffer)):
+        if not self.level_ref.capture(self._level_capture_samples):
+            self._update_level_ui()
             self.level_status_var.set("Could not set level — keep IMU still and try again.")
             return
 
+        self._level_capture_samples = []
         self._samples.clear()
         self._t0 = None
         self._dirty = True
         self._update_level_ui()
+        self.level_status_var.set("Ready — plotting relative to level zero")
 
     def clear_level(self) -> None:
+        self._level_capturing = False
+        if self._level_capture_job:
+            self._root.after_cancel(self._level_capture_job)
+            self._level_capture_job = None
         self.level_ref.clear()
+        self._level_capture_samples = []
         self._samples.clear()
         self._capture_buffer.clear()
         self._t0 = None
@@ -269,6 +327,8 @@ class IMUVisualizerWidget(tk.Frame):
     def destroy(self) -> None:
         if self._refresh_job:
             self._root.after_cancel(self._refresh_job)
+        if self._level_capture_job:
+            self._root.after_cancel(self._level_capture_job)
         super().destroy()
 
     def clear(self) -> None:
@@ -284,6 +344,10 @@ class IMUVisualizerWidget(tk.Frame):
     ) -> None:
         raw = {"ax": ax, "ay": ay, "az": az, "gx": gx, "gy": gy, "gz": gz}
         self._capture_buffer.append(raw)
+
+        if self._level_capturing:
+            self._level_capture_samples.append(raw)
+            return
 
         if not self.level_ref.active:
             return
@@ -336,7 +400,7 @@ class IMUVisualizerWidget(tk.Frame):
                            edgecolor=theme.BORDER, fontsize=7)
 
         draw_orientation_block(
-            self.ax_orientation, 0.0, 0.0, GRAVITY,
+            self.ax_orientation, 0.0, 0.0, 9.80665,
             elev=self._default_elev, azim=self._default_azim,
         )
 
@@ -347,31 +411,35 @@ class IMUVisualizerWidget(tk.Frame):
         self._initialized = True
 
     def _reset_3d_view(self) -> None:
-        if self._samples:
+        if self.level_ref.active and self._capture_buffer:
+            last = self._capture_buffer[-1]
+            rel = self.level_ref.relative(
+                last["ax"], last["ay"], last["az"],
+                last["gx"], last["gy"], last["gz"],
+            )
+            self._draw_orientation_relative(
+                last["ax"], last["ay"], last["az"],
+                roll_deg=rel["roll"], pitch_deg=rel["pitch"],
+            )
+        elif self._samples:
             last = self._samples[-1]
-            self._draw_orientation_block_relative(last.ax, last.ay, last.az)
+            self._draw_orientation_relative(0.0, 0.0, 0.0, roll_deg=0.0, pitch_deg=0.0)
         else:
             draw_orientation_block(
-                self.ax_orientation, 0.0, 0.0, GRAVITY,
+                self.ax_orientation, 0.0, 0.0, 9.80665,
                 elev=self._default_elev, azim=self._default_azim,
                 roll_deg=0.0, pitch_deg=0.0,
             )
         self._redraw_canvas()
 
-    def _draw_orientation_block_relative(
-        self, rax: float, ray: float, raz: float, *, roll_deg: float = 0.0, pitch_deg: float = 0.0,
+    def _draw_orientation_relative(
+        self, ax: float, ay: float, az: float, *, roll_deg: float, pitch_deg: float,
     ) -> None:
         elev = self.ax_orientation.elev
         azim = self.ax_orientation.azim
-        mag = float(np.hypot(rax, np.hypot(ray, raz)))
-        if mag < 0.5:
-            draw_orientation_block(
-                self.ax_orientation, 0.0, 0.0, GRAVITY,
-                elev=elev, azim=azim, roll_deg=roll_deg, pitch_deg=pitch_deg,
-            )
-            return
-        draw_orientation_block(
-            self.ax_orientation, rax, ray, raz,
+        rot = self.level_ref.relative_rotation(ax, ay, az)
+        draw_orientation_block_relative(
+            self.ax_orientation, rot,
             elev=elev, azim=azim, roll_deg=roll_deg, pitch_deg=pitch_deg,
         )
 
@@ -384,12 +452,14 @@ class IMUVisualizerWidget(tk.Frame):
     def _draw_idle_state(self) -> None:
         if not self._initialized:
             return
-        show_overlay = not self.level_ref.active or not self._samples
+        show_overlay = self._level_capturing or not self.level_ref.active or not self._samples
         self._idle_text.set_alpha(0.85 if show_overlay else 0.0)
-        if not self.level_ref.active:
+        if self._level_capturing:
+            self._idle_text.set_text("Capturing level zero… hold IMU still")
+        elif not self.level_ref.active:
             self._idle_text.set_text("Place IMU level and click  Level Your IMU")
         elif not self._samples:
-            self._idle_text.set_text("Level set — waiting for samples…")
+            self._idle_text.set_text("Ready — waiting for samples…")
 
     @staticmethod
     def _smooth_ylim(data: np.ndarray, pad: float = 0.15, min_span: float = 1.0) -> tuple[float, float]:
@@ -416,13 +486,20 @@ class IMUVisualizerWidget(tk.Frame):
         if not self._initialized or not self._running:
             return
 
-        if not self.level_ref.active or not self._samples:
+        if self._level_capturing or not self.level_ref.active or not self._samples:
             self.roll_var.set("Roll  —")
             self.pitch_var.set("Pitch  —")
             self.yaw_var.set("Yaw rate  —")
-            if self._capture_buffer:
+            if self._level_capturing:
+                elapsed = time.time() - self._level_capture_start
+                remaining = max(0.0, LEVEL_CAPTURE_SECONDS - elapsed)
                 self.stats_var.set(
-                    f"Buffering {len(self._capture_buffer)} samples — level IMU to start plots"
+                    f"Capturing zero… {remaining:.0f}s left  ·  "
+                    f"{len(self._level_capture_samples)} samples"
+                )
+            elif self._capture_buffer:
+                self.stats_var.set(
+                    f"{len(self._capture_buffer)} samples buffered — click Level Your IMU"
                 )
             self._draw_idle_state()
             self._redraw_canvas()
@@ -457,8 +534,9 @@ class IMUVisualizerWidget(tk.Frame):
             last_raw["ax"], last_raw["ay"], last_raw["az"],
             last_raw["gx"], last_raw["gy"], last_raw["gz"],
         )
-        self._draw_orientation_block_relative(
-            rel["ax"], rel["ay"], rel["az"], roll_deg=rel["roll"], pitch_deg=rel["pitch"],
+        self._draw_orientation_relative(
+            last_raw["ax"], last_raw["ay"], last_raw["az"],
+            roll_deg=rel["roll"], pitch_deg=rel["pitch"],
         )
 
         self.roll_var.set(f"Roll  {rel['roll']:+.1f}°")
