@@ -88,17 +88,27 @@ def load_bno055_profile(model_label: str, path: Path | None = None) -> dict[str,
     return profile
 
 
-def build_bmi160_export_payload(cal: CalibrationData, model_label: str) -> dict[str, Any]:
+def build_calibration_export_payload(cal: CalibrationData, model_label: str) -> dict[str, Any]:
     saved_at = cal.saved_at or time.strftime("%Y-%m-%d %H:%M:%S")
     cal_dict = cal.to_dict()
+    model = normalize_imu_model(model_label)
+    if model == IMU_MODEL_BNO055:
+        description = (
+            "BNO055 calibration profile for IMU_Calibrator. "
+            "Gyro/accel/mag offsets from 30 s capture workflows; applied in the GUI during live view."
+        )
+        device_usage = "BNO055: calibration is applied in the GUI (firmware does not use SET_CAL)"
+    else:
+        description = (
+            "BMI160 calibration profile for IMU_Calibrator. "
+            "Import in the GUI or send calibration fields to firmware with SET_CAL."
+        )
+        device_usage = "Connect IMU → Write calibration to device (sends SET_CAL to firmware)"
     return {
-        "imu_model": normalize_imu_model(model_label),
+        "imu_model": model,
         "format_version": CALIBRATION_FORMAT_VERSION,
         "saved_at": saved_at,
-        "description": (
-            f"{normalize_imu_model(model_label)} calibration profile for IMU_Calibrator. "
-            "Import in the GUI or send calibration fields to firmware with SET_CAL (BMI160 firmware)."
-        ),
+        "description": description,
         "units": {
             "gyro_offset": "deg/s",
             "accel_offset": "m/s²",
@@ -116,11 +126,15 @@ def build_bmi160_export_payload(cal: CalibrationData, model_label: str) -> dict[
         "usage": {
             "import": "IMU Calibration Tool → Calibration tab → Import JSON…",
             "export": "Same tab → Export JSON… to share this file",
-            "device": "Connect IMU → Write calibration to device (sends SET_CAL to firmware)",
+            "device": device_usage,
             "fields_for_code": "Use the calibration object below (gyro_offset, accel_offset, accel_scale, mag_offset, mag_soft_iron)",
         },
         "calibration": cal_dict,
     }
+
+
+# Backwards-compatible alias
+build_bmi160_export_payload = build_calibration_export_payload
 
 
 def extract_bmi160_calibration(payload: dict[str, Any]) -> CalibrationData:

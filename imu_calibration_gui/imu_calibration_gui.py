@@ -19,6 +19,7 @@ from calibration import (
     CALIBRATION_MIN_SAMPLES,
     accel_calibration_valid,
     apply_calibration,
+    build_calibration_export_payload,
     build_bmi160_export_payload,
     build_bno055_export_payload,
     calibrate_accel_six_face,
@@ -696,7 +697,7 @@ class BMI160CalibrationApp:
         ttk.Button(action_frame, text="Reset Calibration", command=self._reset_calibration).pack(side="left", padx=4)
 
     def _build_status_bar(self, parent: ttk.Frame) -> None:
-        self.status_var = tk.StringVar(value="Connect your BMI160 board and start a calibration workflow.")
+        self.status_var = tk.StringVar(value="BNO055: connect your board on COM7 and start calibration.")
         ttk.Label(parent, textvariable=self.status_var, relief="sunken", padding=6).pack(fill="x")
 
     def _on_imu_model_changed(self) -> None:
@@ -758,11 +759,11 @@ class BMI160CalibrationApp:
         self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
         if self._is_bno055_mode():
             self.model_workflow_note.set(
-                "BNO055: gyro/accel/mag calibration uses the same 30 s workflows as BMI160. "
-                "Values are saved to bno055_calibration.json and applied in the GUI."
+                "BNO055 streams m/s², deg/s, and µT over serial. "
+                "Calibration saves gyro_offset, accel_offset, accel_scale, and mag values to bno055_calibration.json."
             )
             if not self.client.is_connected:
-                self.status_var.set("Select BNO055, connect COM port, then run calibration workflows.")
+                self.status_var.set("BNO055: connect COM7, wait for streaming, then run calibration steps below.")
         else:
             self.model_workflow_note.set(
                 "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160_YYYYMMDD_HHMMSS.json."
@@ -934,6 +935,8 @@ class BMI160CalibrationApp:
         self.root.destroy()
 
     def _normalize_samples(self, samples: list[dict[str, float]]) -> list[dict[str, float]]:
+        if self._is_bno055_mode():
+            return [dict(s) for s in samples]
         return normalize_samples(samples, self._stream_scale)
 
     def _on_level_reference_changed(self) -> None:
@@ -1002,6 +1005,8 @@ class BMI160CalibrationApp:
             self._mag_plot_frame.grid_remove()
 
     def _normalize_data(self, data: dict[str, float]) -> dict[str, float]:
+        if self._is_bno055_mode():
+            return dict(data)
         return normalize_sample(data, self._stream_scale)
 
     def _update_display_loop(self) -> None:
@@ -1585,7 +1590,7 @@ class BMI160CalibrationApp:
         )
         if not path:
             return
-        payload = build_bmi160_export_payload(self.store.data, self.imu_model_var.get())
+        payload = build_calibration_export_payload(self.store.data, self.imu_model_var.get())
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         messagebox.showinfo("Exported", f"{self._current_model_id()} calibration exported to:\n{path}")
