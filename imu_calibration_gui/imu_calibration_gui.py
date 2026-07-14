@@ -121,9 +121,9 @@ class BMI160CalibrationApp:
         self.root.geometry("1150x860")
         self.root.minsize(1050, 780)
 
-        self.imu_model_var = tk.StringVar(value=IMU_MODEL_BMI160)
-        self._active_imu_model = IMU_MODEL_BMI160
-        self.store = CalibrationStore(model_label=IMU_MODEL_BMI160)
+        self.imu_model_var = tk.StringVar(value=IMU_MODEL_BNO055)
+        self._active_imu_model = IMU_MODEL_BNO055
+        self.store = CalibrationStore(model_label=IMU_MODEL_BNO055)
         self.store.load()
         self.client = SerialIMUClient(on_sample=self._on_sample)
         self.client.set_on_reader_stopped(self._on_serial_reader_stopped)
@@ -863,13 +863,42 @@ class BMI160CalibrationApp:
         self.imu_visualizer.clear_level()
         self.imu_visualizer.clear()
         self.imu_visualizer.set_running(self.notebook.index(self.notebook.select()) == 0)
-        self.status_var.set(f"Connected to {port} at {baud} baud.")
+        self.status_var.set(f"Connected to {port} at {baud} baud — waiting for board…")
 
-        def ping_worker() -> None:
-            ok = self.client.ping_device()
-            self.root.after(0, lambda: self._on_ping_done(port, ok))
+        def connect_worker() -> None:
+            if self._is_bno055_mode():
+                self._start_bno055_stream_after_connect(port)
+            else:
+                ok = self.client.ping_device()
+                self.root.after(0, lambda: self._on_ping_done(port, ok))
 
-        threading.Thread(target=ping_worker, daemon=True).start()
+        threading.Thread(target=connect_worker, daemon=True).start()
+
+    def _start_bno055_stream_after_connect(self, port: str) -> None:
+        try:
+            response = self.client.send_command("BNO_BEGIN", timeout=8.0)
+            kind, payload = parse_cal_response(response or "")
+            if kind != "BNO_BEGIN" or not payload:
+                msg = "BNO_BEGIN failed"
+                if payload and payload.get("message"):
+                    msg = str(payload["message"])
+                elif response:
+                    msg = f"unexpected response: {response}"
+                self.root.after(0, lambda: self.status_var.set(f"Connected to {port} — {msg}"))
+                return
+            self._bno_initialized = True
+            self.client.write_command("CAL_MODE_ON")
+            self._calibration_mode_on = True
+            self._arm_stream_watchdog()
+            self.root.after(0, self._refresh_calibration_mode_button)
+            self.root.after(
+                0,
+                lambda: self.status_var.set(
+                    f"Connected to {port} — BNO055 initialized, streaming (CAL_MODE_ON)."
+                ),
+            )
+        except RuntimeError as exc:
+            self.root.after(0, lambda: self.status_var.set(f"BNO055 stream start failed: {exc}"))
 
     def _on_ping_done(self, port: str, ok: bool) -> None:
         if not self.client.is_connected:

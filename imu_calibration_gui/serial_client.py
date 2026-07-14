@@ -160,7 +160,7 @@ class SerialIMUClient:
     def set_on_reader_stopped(self, callback: Callable[[], None] | None) -> None:
         self._on_reader_stopped = callback
 
-    def connect(self, port: str, baud: int = 115200) -> None:
+    def connect(self, port: str, baud: int = 115200, boot_delay_s: float = 2.5) -> None:
         if self.is_connected:
             self.disconnect()
         self._ser = serial.Serial(port, baud, timeout=1)
@@ -169,6 +169,17 @@ class SerialIMUClient:
         self._sample_count = 0
         self._rate_hz = 0.0
         self._last_sample_time = None
+        self._running = False
+        self._reader_alive = False
+        # Opening the port resets many Arduino boards — wait for boot text to finish.
+        if boot_delay_s > 0:
+            time.sleep(boot_delay_s)
+        self._ser.reset_input_buffer()
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except Empty:
+                break
         self._running = True
         self._reader_alive = True
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -204,9 +215,21 @@ class SerialIMUClient:
             items = list(self._history)[-max_samples:]
             return [s.as_dict() for s in items]
 
-    def send_command(self, command: str, timeout: float = 3.0) -> str | None:
+    def send_command(
+        self,
+        command: str,
+        timeout: float = 3.0,
+        expect_prefix: str | None = None,
+    ) -> str | None:
         if not self.is_connected or not self._ser:
             raise RuntimeError("Serial port is not connected")
+
+        if expect_prefix is None:
+            cmd = command.strip().split()[0]
+            if cmd == "PING":
+                expect_prefix = "PONG"
+            else:
+                expect_prefix = cmd
 
         while not self._response_queue.empty():
             try:
@@ -221,10 +244,18 @@ class SerialIMUClient:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                return self._response_queue.get(timeout=0.1)
+                line = self._response_queue.get(timeout=0.1)
             except Empty:
                 continue
+            if self._response_matches(line, expect_prefix):
+                return line
         return None
+
+    @staticmethod
+    def _response_matches(line: str, expect_prefix: str) -> bool:
+        if line == expect_prefix:
+            return True
+        return line.startswith(f"{expect_prefix} ") or line.startswith(f"{expect_prefix}{{")
 
     def write_command(self, command: str) -> None:
         if not self.is_connected or not self._ser:
