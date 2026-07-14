@@ -735,56 +735,35 @@ class BMI160CalibrationApp:
     def _update_model_profile_label(self) -> None:
         model_id = self._current_model_id()
         export_name = export_filename_pattern(self.imu_model_var.get())
-        if self._is_bno055_mode():
-            store_path = default_calibration_store_path(self.imu_model_var.get())
-            self.model_profile_var.set(
-                f"Profile store: {store_path.name} · export as {export_name}"
-            )
-        else:
-            self.model_profile_var.set(
-                f"Profile store: {self.store.path.name} · export as {export_name}"
-            )
-        self.save_path_var.set(
-            f"IMU: {model_id} · profile: {self.store.path if not self._is_bno055_mode() else default_calibration_store_path(self.imu_model_var.get())}"
+        self.model_profile_var.set(
+            f"Profile store: {self.store.path.name} · export as {export_name}"
         )
+        self.save_path_var.set(f"IMU: {model_id} · profile: {self.store.path}")
 
     def _is_bno055_mode(self) -> bool:
         return self.imu_model_var.get() == IMU_MODEL_BNO055
 
     def _refresh_imu_model_ui(self) -> None:
-        if self._is_bno055_mode():
-            self.calibration_instr.config(
-                text=(
-                    "BNO055 uses Bosch internal fusion calibration. Keep the device still for gyro, "
-                    "move through 6 stable orientations for accel, and rotate through random 3D / "
-                    "figure-eight motion for mag until SYS/GYR/ACC/MAG all reach 3."
-                )
+        self.calibration_instr.config(
+            text=(
+                "Static steps average samples over 30 seconds while you hold the IMU still "
+                "(same method as Live View → Level Your IMU). Export JSON to share calibration."
             )
-            self.gyro_btn.config(text="1. BNO055 — Initialize / NDOF", command=self._bno_begin)
-            self.accel_flat_btn.config(text="2. BNO055 — Monitor calibration status", command=self._bno_monitor_calibration)
-            self.accel_flat_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
-            self.accel_six_btn.config(text="3. BNO055 — Read & save device profile", command=self._bno_read_profile_from_device)
-            self.mag_btn.config(text="4. BNO055 — Write loaded profile to device", command=self._bno_write_profile_to_device)
+        )
+        self.gyro_btn.config(text="1. Level calibration (30s)", command=self._start_level_cal)
+        self.accel_flat_btn.grid_remove()
+        self.accel_six_btn.config(text="2. Accel — Six-Face (30s each)", command=self._start_accel_six_face)
+        self.accel_six_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        self.mag_btn.config(text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
+        self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
+        if self._is_bno055_mode():
             self.model_workflow_note.set(
-                "Use the new firmware sketch at firmware/bno055_serial_cal/ for Nano/ESP32. "
-                "The GUI will initialize BNO055, poll SYS/GYR/ACC/MAG status, and read/write the "
-                "22-byte calibration profile over serial."
+                "BNO055: gyro/accel/mag calibration uses the same 30 s workflows as BMI160. "
+                "Values are saved to bno055_calibration.json and applied in the GUI."
             )
             if not self.client.is_connected:
-                self.status_var.set("Connect your BNO055-over-serial board and click Initialize / NDOF first.")
+                self.status_var.set("Select BNO055, connect COM port, then run calibration workflows.")
         else:
-            self.calibration_instr.config(
-                text=(
-                    "Static steps average samples over 30 seconds while you hold the IMU still "
-                    "(same method as Live View → Level Your IMU). Export JSON to share calibration."
-                )
-            )
-            self.gyro_btn.config(text="1. Level calibration (30s)", command=self._start_level_cal)
-            self.accel_flat_btn.grid_remove()
-            self.accel_six_btn.config(text="2. Accel — Six-Face (30s each)", command=self._start_accel_six_face)
-            self.accel_six_btn.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
-            self.mag_btn.config(text="3. Magnetometer — Figure-8 (30s)", command=self._start_mag_cal)
-            self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
             self.model_workflow_note.set(
                 "BMI160 calibration is saved locally and exported as IMU_Calibration_BMI160_YYYYMMDD_HHMMSS.json."
             )
@@ -795,16 +774,7 @@ class BMI160CalibrationApp:
 
     def _apply_mode_button_states(self) -> None:
         base_state = "disabled" if self._ui_disabled else "normal"
-        if self._is_bno055_mode():
-            if not self.client.is_connected:
-                base_state = "disabled"
-            for btn in (self.gyro_btn, self.accel_flat_btn, self.accel_six_btn, self.mag_btn):
-                btn.config(state=base_state)
-            return
-
         self.gyro_btn.config(state=base_state)
-        if self._is_bno055_mode():
-            self.accel_flat_btn.config(state=base_state)
         self.accel_six_btn.config(state=base_state)
         self.mag_btn.config(state="normal" if self.client.has_magnetometer and not self._ui_disabled else "disabled")
 
@@ -1364,6 +1334,12 @@ class BMI160CalibrationApp:
         if not self._ensure_connected():
             return False
         if self._is_bno055_mode():
+            if not self._calibration_mode_on:
+                messagebox.showerror(
+                    "Streaming Required",
+                    "Connect to the BNO055 and wait until streaming is active before calibration.",
+                )
+                return False
             return True
         if not self._calibration_mode_on:
             messagebox.showerror(
@@ -1382,13 +1358,6 @@ class BMI160CalibrationApp:
         target_samples: int | None = None,
         capture_seconds: float | None = None,
     ) -> None:
-        if self._is_bno055_mode():
-            messagebox.showinfo(
-                "BNO055 Workflow",
-                "BNO055 uses its own internal fusion calibration. Use the direct-I2C helper in "
-                "bno055_i2c.py to run begin(), wait_for_full_calibration(), and save/load the 22-byte profile.",
-            )
-            return
         if not self._ensure_calibration_mode():
             return
 
@@ -1477,13 +1446,6 @@ class BMI160CalibrationApp:
         self._start_level_cal()
 
     def _start_accel_six_face(self) -> None:
-        if self._is_bno055_mode():
-            messagebox.showinfo(
-                "BNO055 Workflow",
-                "Six-face sample fitting is for raw IMUs like BMI160. For BNO055 use the internal "
-                "calibration-status workflow and save/load the device profile with bno055_i2c.py.",
-            )
-            return
         if not self._ensure_calibration_mode():
             return
 
@@ -1566,38 +1528,14 @@ class BMI160CalibrationApp:
         for item in self.cal_table.get_children():
             self.cal_table.delete(item)
 
-        if self._is_bno055_mode():
-            rows: list[tuple[str, str]] = []
-            if self._bno_status:
-                rows.extend(
-                    [
-                        ("BNO055 SYS cal", f"{int(self._bno_status.get('sys', 0))}/3"),
-                        ("BNO055 GYR cal", f"{int(self._bno_status.get('gyr', 0))}/3"),
-                        ("BNO055 ACC cal", f"{int(self._bno_status.get('acc', 0))}/3"),
-                        ("BNO055 MAG cal", f"{int(self._bno_status.get('mag', 0))}/3"),
-                    ]
-                )
-            if self._bno_profile:
-                rows.append(("Profile address", f"0x{int(self._bno_profile.get('address', 0)):02X}"))
-                rows.append(("Axis map config", f"0x{int(self._bno_profile.get('axis_map_config', 0)):02X}"))
-                rows.append(("Axis map sign", f"0x{int(self._bno_profile.get('axis_map_sign', 0)):02X}"))
-                profile_bytes = self._bno_profile.get("calibration_bytes", [])
-                rows.append(("Profile bytes", " ".join(f"{int(v):02X}" for v in profile_bytes)))
-            if not rows:
-                rows.append(("Status", "No BNO055 profile loaded yet — initialize and monitor calibration first"))
-            for param, value in rows:
-                self.cal_table.insert("", "end", values=(param, value))
-            self._update_model_profile_label()
-            return
-
         cal = self.store.data
         rows: list[tuple[str, str]] = [
-            ("Gyro offset X", f"{cal.gyro_offset['x']:+.4f}"),
-            ("Gyro offset Y", f"{cal.gyro_offset['y']:+.4f}"),
-            ("Gyro offset Z", f"{cal.gyro_offset['z']:+.4f}"),
-            ("Accel offset X", f"{cal.accel_offset['x']:+.4f}"),
-            ("Accel offset Y", f"{cal.accel_offset['y']:+.4f}"),
-            ("Accel offset Z", f"{cal.accel_offset['z']:+.4f}"),
+            ("Gyro offset X", f"{cal.gyro_offset['x']:+.6f}"),
+            ("Gyro offset Y", f"{cal.gyro_offset['y']:+.6f}"),
+            ("Gyro offset Z", f"{cal.gyro_offset['z']:+.6f}"),
+            ("Accel offset X", f"{cal.accel_offset['x']:+.6f}"),
+            ("Accel offset Y", f"{cal.accel_offset['y']:+.6f}"),
+            ("Accel offset Z", f"{cal.accel_offset['z']:+.6f}"),
             ("Accel scale X", f"{cal.accel_scale['x']:.6f}"),
             ("Accel scale Y", f"{cal.accel_scale['y']:.6f}"),
             ("Accel scale Z", f"{cal.accel_scale['z']:.6f}"),
@@ -1611,7 +1549,7 @@ class BMI160CalibrationApp:
         if cal.saved_at:
             rows.append(("Last saved", cal.saved_at))
         else:
-            rows.append(("Status", "No calibration saved yet — run a workflow above"))
+            rows.append(("Status", "No calibration saved yet — run Level calibration (30s) first"))
 
         for param, value in rows:
             self.cal_table.insert("", "end", values=(param, value))
@@ -1647,13 +1585,7 @@ class BMI160CalibrationApp:
         )
         if not path:
             return
-        if self._is_bno055_mode():
-            if not self._bno_profile:
-                messagebox.showerror("Export Failed", "Read or import a BNO055 profile first.")
-                return
-            payload = build_bno055_export_payload(self._bno_profile, self.imu_model_var.get())
-        else:
-            payload = build_bmi160_export_payload(self.store.data, self.imu_model_var.get())
+        payload = build_bmi160_export_payload(self.store.data, self.imu_model_var.get())
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         messagebox.showinfo("Exported", f"{self._current_model_id()} calibration exported to:\n{path}")
@@ -1677,39 +1609,51 @@ class BMI160CalibrationApp:
                 return
             self._switch_to_model_for_import(file_model)
 
-        if self._is_bno055_mode():
+        if self._is_bno055_mode() and ("calibration" not in payload):
             profile = payload.get("bno055_profile", payload)
-            if "calibration_bytes" not in profile:
-                messagebox.showerror("Import Failed", "This JSON does not contain a BNO055 profile.")
+            if "calibration_bytes" in profile:
+                self._bno_profile = profile
+                save_bno055_profile(profile, self.imu_model_var.get())
+                self._refresh_cal_table()
+                messagebox.showinfo(
+                    "Imported",
+                    f"Legacy BNO055 chip profile loaded from:\n{path}\n\n"
+                    "For gyro/accel offsets, import a file with a calibration block or run Level calibration (30s).",
+                )
                 return
-            self._bno_profile = profile
-            save_bno055_profile(profile, self.imu_model_var.get())
-            self._refresh_cal_table()
-            messagebox.showinfo("Imported", f"BNO055 profile loaded from:\n{path}")
-        else:
-            self.store.data = extract_bmi160_calibration(payload)
-            self.store.save()
-            self._refresh_cal_table()
-            messagebox.showinfo("Imported", f"BMI160 calibration loaded from:\n{path}")
+
+        if "calibration" not in payload:
+            messagebox.showerror(
+                "Import Failed",
+                "This JSON does not contain a calibration block (gyro_offset, accel_offset, accel_scale).",
+            )
+            return
+
+        self.store.data = extract_bmi160_calibration(payload)
+        self.store.save()
+        self._refresh_cal_table()
+        messagebox.showinfo("Imported", f"{self._current_model_id()} calibration loaded from:\n{path}")
 
     def _reset_calibration(self) -> None:
         if not messagebox.askyesno("Reset", f"Clear all {self._current_model_id()} calibration values?"):
             return
-        if self._is_bno055_mode():
-            self._bno_profile = None
-            self._bno_status = None
-            store_path = default_calibration_store_path(self.imu_model_var.get())
-            if store_path.exists():
-                store_path.unlink()
-        else:
-            from calibration import CalibrationData
-            self.store.data = CalibrationData()
-            self.store.save()
+        from calibration import CalibrationData
+        self.store.data = CalibrationData()
+        self.store.save()
+        self._bno_profile = None
+        self._bno_status = None
         self._refresh_cal_table()
         self.status_var.set(f"{self._current_model_id()} calibration reset to defaults.")
 
     def _write_calibration_to_device(self) -> None:
         if not self._ensure_connected():
+            return
+        if self._is_bno055_mode():
+            messagebox.showinfo(
+                "BNO055",
+                "BNO055 firmware does not use SET_CAL. Calibration is saved in the JSON profile "
+                "and applied in the GUI during live view.",
+            )
             return
 
         cmd = format_set_cal_command(self.store.data)

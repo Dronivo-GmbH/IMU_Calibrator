@@ -96,8 +96,8 @@ def build_bmi160_export_payload(cal: CalibrationData, model_label: str) -> dict[
         "format_version": CALIBRATION_FORMAT_VERSION,
         "saved_at": saved_at,
         "description": (
-            "BMI160 calibration profile for IMU_Calibrator. "
-            "Import in the GUI or send calibration fields to firmware with SET_CAL."
+            f"{normalize_imu_model(model_label)} calibration profile for IMU_Calibrator. "
+            "Import in the GUI or send calibration fields to firmware with SET_CAL (BMI160 firmware)."
         ),
         "units": {
             "gyro_offset": "deg/s",
