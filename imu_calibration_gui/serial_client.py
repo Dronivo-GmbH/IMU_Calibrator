@@ -16,6 +16,26 @@ from device_protocol import is_command_response
 
 GRAVITY = 9.80665
 
+# Serial command → expected response prefix(es). Firmware names differ from command names.
+_COMMAND_RESPONSE_PREFIXES: dict[str, str | tuple[str, ...]] = {
+    "PING": "PONG",
+    "BNO_BEGIN": "BNO_BEGIN",
+    "BNO_GET_STATUS": "BNO_STATUS",
+    "BNO_READ_PROFILE": "BNO_PROFILE",
+    "BNO_READ_EULER": "BNO_EULER",
+    "BNO_READ_QUAT": "BNO_QUAT",
+    "BNO_WRITE_PROFILE": ("BNO_WRITE_OK", "BNO_WRITE_ERR", "BNO_ERR"),
+    "BNO_SAVE_PROFILE": ("BNO_WRITE_OK", "BNO_WRITE_ERR", "BNO_ERR"),
+    "BNO_LOAD_PROFILE": ("BNO_WRITE_OK", "BNO_WRITE_ERR", "BNO_ERR"),
+    "GET_CAL": "CAL",
+    "SET_CAL": ("CAL_OK", "CAL_ERR"),
+}
+
+
+def _expected_response_prefix(command: str) -> str | tuple[str, ...]:
+    cmd = command.strip().split()[0]
+    return _COMMAND_RESPONSE_PREFIXES.get(cmd, cmd)
+
 
 @dataclass
 class IMUSample:
@@ -225,11 +245,7 @@ class SerialIMUClient:
             raise RuntimeError("Serial port is not connected")
 
         if expect_prefix is None:
-            cmd = command.strip().split()[0]
-            if cmd == "PING":
-                expect_prefix = "PONG"
-            else:
-                expect_prefix = cmd
+            expect_prefix = _expected_response_prefix(command)
 
         while not self._response_queue.empty():
             try:
@@ -252,10 +268,14 @@ class SerialIMUClient:
         return None
 
     @staticmethod
-    def _response_matches(line: str, expect_prefix: str) -> bool:
-        if line == expect_prefix:
-            return True
-        return line.startswith(f"{expect_prefix} ") or line.startswith(f"{expect_prefix}{{")
+    def _response_matches(line: str, expect_prefix: str | tuple[str, ...]) -> bool:
+        prefixes = (expect_prefix,) if isinstance(expect_prefix, str) else expect_prefix
+        for prefix in prefixes:
+            if line == prefix:
+                return True
+            if line.startswith(f"{prefix} ") or line.startswith(f"{prefix}{{"):
+                return True
+        return False
 
     def write_command(self, command: str) -> None:
         if not self.is_connected or not self._ser:

@@ -1240,7 +1240,7 @@ class BMI160CalibrationApp:
         def worker() -> None:
             while self._bno_monitor_active and self.client.is_connected:
                 try:
-                    response = self.client.send_command("BNO_GET_STATUS", timeout=3.0)
+                    response = self.client.send_command("BNO_GET_STATUS", timeout=5.0)
                 except RuntimeError as exc:
                     self.root.after(0, lambda: self._finish_bno_monitor(error=str(exc)))
                     return
