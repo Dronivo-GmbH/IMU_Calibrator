@@ -94,14 +94,23 @@ def build_calibration_export_payload(cal: CalibrationData, model_label: str) -> 
     model = normalize_imu_model(model_label)
     if model == IMU_MODEL_BNO055:
         description = (
-            "BNO055 calibration profile for IMU_Calibrator. "
-            "Gyro/accel/mag offsets from 30 s capture workflows; applied in the GUI during live view."
+            "BNO055 9-axis calibration profile for IMU_Calibrator. "
+            "Includes gyro, accelerometer, and magnetometer offsets from 30 s capture workflows; "
+            "applied in the GUI during live view."
+        )
+        capture_notes = (
+            "Level: gyro + accel, hold still 30 s. Six-face: accel, 30 s per orientation. "
+            "Magnetometer: figure-8 motion 30 s (required for 9-axis heading)."
         )
         device_usage = "BNO055: calibration is applied in the GUI (firmware does not use SET_CAL)"
     else:
         description = (
             "BMI160 calibration profile for IMU_Calibrator. "
             "Import in the GUI or send calibration fields to firmware with SET_CAL."
+        )
+        capture_notes = (
+            "Level step: place IMU flat (+Z up), hold still for 30 s. "
+            "Six-face: hold each orientation still for 30 s."
         )
         device_usage = "Connect IMU → Write calibration to device (sends SET_CAL to firmware)"
     return {
@@ -118,10 +127,7 @@ def build_calibration_export_payload(cal: CalibrationData, model_label: str) -> 
         "capture": {
             "method": "average_while_hold_still",
             "static_pose_seconds": CALIBRATION_CAPTURE_SECONDS,
-            "notes": (
-                "Level step: place IMU flat (+Z up), hold still for 30 s. "
-                "Six-face: hold each orientation still for 30 s."
-            ),
+            "notes": capture_notes,
         },
         "usage": {
             "import": "IMU Calibration Tool → Calibration tab → Import JSON…",

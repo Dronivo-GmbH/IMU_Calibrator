@@ -336,15 +336,9 @@ class BMI160CalibrationApp:
         self.conn_status = ttk.Label(frame, text="Disconnected", style="Status.Disconnected.TLabel")
         self.conn_status.grid(row=1, column=7, padx=(16, 0))
 
-        ttk.Label(
-            frame,
-            text="CSV formats: ax,ay,az,gx,gy,gz  (DFRobot ESP32)  or  +mx,my,mz for 9-axis",
-            foreground="#57606a",
-        ).grid(row=2, column=0, columnspan=7, sticky="w", pady=(8, 0))
-
         self.stream_mode_var = tk.StringVar(value="Stream: —")
         ttk.Label(frame, textvariable=self.stream_mode_var, foreground="#57606a").grid(
-            row=2, column=7, sticky="e", pady=(8, 0)
+            row=2, column=0, columnspan=8, sticky="w", pady=(8, 0)
         )
 
         filter_row = ttk.Frame(frame)
@@ -744,13 +738,29 @@ class BMI160CalibrationApp:
     def _is_bno055_mode(self) -> bool:
         return self.imu_model_var.get() == IMU_MODEL_BNO055
 
+    def _sensor_has_magnetometer(self) -> bool:
+        """BNO055 is always 9-axis; BMI160 only when the stream includes mx,my,mz."""
+        if self._is_bno055_mode() and self.client.is_connected:
+            return True
+        return self.client.has_magnetometer
+
     def _refresh_imu_model_ui(self) -> None:
-        self.calibration_instr.config(
-            text=(
-                "Static steps average samples over 30 seconds while you hold the IMU still "
-                "(same method as Live View → Level Your IMU). Export JSON to share calibration."
+        if self._is_bno055_mode():
+            self.calibration_instr.config(
+                text=(
+                    "BNO055 9-axis calibration: (1) Level 30 s — gyro + accel. "
+                    "(2) Optional Six-face 30 s each — better accel. "
+                    "(3) Magnetometer figure-8 30 s — required for mag. "
+                    "All values saved to JSON."
+                )
             )
-        )
+        else:
+            self.calibration_instr.config(
+                text=(
+                    "Static steps average samples over 30 seconds while you hold the IMU still "
+                    "(same method as Live View → Level Your IMU). Export JSON to share calibration."
+                )
+            )
         self.gyro_btn.config(text="1. Level calibration (30s)", command=self._start_level_cal)
         self.accel_flat_btn.grid_remove()
         self.accel_six_btn.config(text="2. Accel — Six-Face (30s each)", command=self._start_accel_six_face)
@@ -759,8 +769,8 @@ class BMI160CalibrationApp:
         self.mag_btn.grid(row=2, column=2, padx=4, pady=4, sticky="ew")
         if self._is_bno055_mode():
             self.model_workflow_note.set(
-                "BNO055 streams m/s², deg/s, and µT over serial. "
-                "Calibration saves gyro_offset, accel_offset, accel_scale, and mag values to bno055_calibration.json."
+                "BNO055 9-axis (accel + gyro + magnetometer): stream is ax,ay,az,gx,gy,gz,mx,my,mz in m/s², deg/s, µT. "
+                "Run all three calibration steps, then Export JSON."
             )
             if not self.client.is_connected:
                 self.status_var.set("BNO055: connect COM7, wait for streaming, then run calibration steps below.")
@@ -777,7 +787,8 @@ class BMI160CalibrationApp:
         base_state = "disabled" if self._ui_disabled else "normal"
         self.gyro_btn.config(state=base_state)
         self.accel_six_btn.config(state=base_state)
-        self.mag_btn.config(state="normal" if self.client.has_magnetometer and not self._ui_disabled else "disabled")
+        mag_ok = self._sensor_has_magnetometer() and not self._ui_disabled
+        self.mag_btn.config(state="normal" if mag_ok else "disabled")
 
     def _refresh_ports(self) -> None:
         if self._port_scan_running:
@@ -858,10 +869,13 @@ class BMI160CalibrationApp:
                 self.root.after(0, lambda: self.status_var.set(f"Connected to {port} — {msg}"))
                 return
             self._bno_initialized = True
+            self.client.set_nine_axis_stream("9-axis (BNO055)")
             self.client.write_command("CAL_MODE_ON")
             self._calibration_mode_on = True
             self._arm_stream_watchdog()
             self.root.after(0, self._refresh_calibration_mode_button)
+            self.root.after(0, self._update_mag_ui_visibility)
+            self.root.after(0, self._apply_mode_button_states)
             self.root.after(
                 0,
                 lambda: self.status_var.set(
@@ -995,10 +1009,13 @@ class BMI160CalibrationApp:
         self.root.after(0, push_to_visualizer)
 
     def _update_mag_ui_visibility(self) -> None:
-        has_mag = self.client.has_magnetometer
+        has_mag = self._sensor_has_magnetometer()
         if not self._is_bno055_mode():
             state = "normal" if has_mag and not self._ui_disabled else "disabled"
             self.mag_btn.config(state=state)
+        else:
+            mag_ok = has_mag and not self._ui_disabled
+            self.mag_btn.config(state="normal" if mag_ok else "disabled")
         if has_mag:
             self._mag_plot_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         else:
@@ -1054,7 +1071,7 @@ class BMI160CalibrationApp:
 
             self._plot_sample_counter += 1
 
-            if self.client.has_magnetometer:
+            if self._sensor_has_magnetometer():
                 if self._plot_sample_counter % 3 == 0:
                     raw_mag = (physical["mx"], physical["my"], physical["mz"])
                     corr_mag = (corrected["mx"], corrected["my"], corrected["mz"])

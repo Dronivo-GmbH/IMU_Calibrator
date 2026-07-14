@@ -180,6 +180,11 @@ class SerialIMUClient:
     def set_on_reader_stopped(self, callback: Callable[[], None] | None) -> None:
         self._on_reader_stopped = callback
 
+    def set_nine_axis_stream(self, label: str = "9-axis") -> None:
+        """Mark stream as 9-axis (accel + gyro + magnetometer). Used for BNO055."""
+        self._has_magnetometer = True
+        self._stream_label = label
+
     def connect(self, port: str, baud: int = 115200, boot_delay_s: float = 2.5) -> None:
         if self.is_connected:
             self.disconnect()
