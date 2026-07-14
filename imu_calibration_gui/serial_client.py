@@ -125,6 +125,8 @@ class SerialIMUClient:
         self._response_queue: Queue[str] = Queue()
         self._has_magnetometer = False
         self._stream_label = "unknown"
+        self._reader_alive = False
+        self._on_reader_stopped: Callable[[], None] | None = None
 
     @property
     def has_magnetometer(self) -> bool:
@@ -151,18 +153,30 @@ class SerialIMUClient:
     def total_samples(self) -> int:
         return self._sample_count
 
+    @property
+    def reader_alive(self) -> bool:
+        return self._reader_alive
+
+    def set_on_reader_stopped(self, callback: Callable[[], None] | None) -> None:
+        self._on_reader_stopped = callback
+
     def connect(self, port: str, baud: int = 115200) -> None:
         if self.is_connected:
             self.disconnect()
         self._ser = serial.Serial(port, baud, timeout=1)
         self._has_magnetometer = False
         self._stream_label = "unknown"
+        self._sample_count = 0
+        self._rate_hz = 0.0
+        self._last_sample_time = None
         self._running = True
+        self._reader_alive = True
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
     def disconnect(self) -> None:
         self._running = False
+        self._reader_alive = False
         if self._thread:
             self._thread.join(timeout=1.5)
             self._thread = None
@@ -227,46 +241,51 @@ class SerialIMUClient:
             return False
 
     def _reader_loop(self) -> None:
-        while self._running and self._ser:
-            try:
-                line = self._ser.readline().decode(errors="ignore").strip()
-                if not line or line.startswith("#") or line.startswith("Starting") or line.startswith("BMI160"):
-                    continue
-                if line.startswith("ax,") or line == "Read error":
-                    continue
+        try:
+            while self._running and self._ser:
+                try:
+                    line = self._ser.readline().decode(errors="ignore").strip()
+                    if not line or line.startswith("#") or line.startswith("Starting") or line.startswith("BMI160"):
+                        continue
+                    if line.startswith("ax,") or line == "Read error":
+                        continue
 
-                if is_command_response(line):
-                    self._response_queue.put(line)
-                    continue
+                    if is_command_response(line):
+                        self._response_queue.put(line)
+                        continue
 
-                data = parse_line(line)
-                if not data:
-                    continue
+                    data = parse_line(line)
+                    if not data:
+                        continue
 
-                mag_active = any(abs(data[k]) > 1e-6 for k in ("mx", "my", "mz"))
-                if mag_active:
-                    self._has_magnetometer = True
-                    self._stream_label = "9-axis"
-                elif self._sample_count == 0:
-                    self._stream_label = "6-axis (DFRobot)"
+                    mag_active = any(abs(data[k]) > 1e-6 for k in ("mx", "my", "mz"))
+                    if mag_active:
+                        self._has_magnetometer = True
+                        self._stream_label = "9-axis"
+                    elif self._sample_count == 0:
+                        self._stream_label = "6-axis (DFRobot)"
 
-                now = time.time()
-                sample = IMUSample(timestamp=now, **data)
+                    now = time.time()
+                    sample = IMUSample(timestamp=now, **data)
 
-                with self._lock:
-                    if self._last_sample_time:
-                        dt = now - self._last_sample_time
-                        if dt > 0:
-                            instant_rate = 1.0 / dt
-                            self._rate_hz = 0.9 * self._rate_hz + 0.1 * instant_rate if self._rate_hz else instant_rate
-                    self._last_sample_time = now
-                    self._latest = sample
-                    self._history.append(sample)
-                    self._sample_count += 1
-                    if self._capture_buffer is not None:
-                        self._capture_buffer.append(sample)
+                    with self._lock:
+                        if self._last_sample_time:
+                            dt = now - self._last_sample_time
+                            if dt > 0:
+                                instant_rate = 1.0 / dt
+                                self._rate_hz = 0.9 * self._rate_hz + 0.1 * instant_rate if self._rate_hz else instant_rate
+                        self._last_sample_time = now
+                        self._latest = sample
+                        self._history.append(sample)
+                        self._sample_count += 1
+                        if self._capture_buffer is not None:
+                            self._capture_buffer.append(sample)
 
-                if self._on_sample:
-                    self._on_sample(sample)
-            except (serial.SerialException, OSError):
-                break
+                    if self._on_sample:
+                        self._on_sample(sample)
+                except (serial.SerialException, OSError):
+                    break
+        finally:
+            self._reader_alive = False
+            if self._on_reader_stopped:
+                self._on_reader_stopped()

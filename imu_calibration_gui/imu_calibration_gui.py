@@ -126,6 +126,7 @@ class BMI160CalibrationApp:
         self.store = CalibrationStore(model_label=IMU_MODEL_BMI160)
         self.store.load()
         self.client = SerialIMUClient(on_sample=self._on_sample)
+        self.client.set_on_reader_stopped(self._on_serial_reader_stopped)
         self.capture = CalibrationCapture(root, self.client)
 
         self._ui_disabled = False
@@ -139,7 +140,10 @@ class BMI160CalibrationApp:
         self.logo_image: object | None = None
         self._bno_profile: dict | None = None
         self._bno_status: dict | None = None
+        self._bno_initialized = False
         self._bno_monitor_active = False
+        self._stream_watch_samples = 0
+        self._stream_watch_deadline: float | None = None
 
         self._build_ui()
         self._refresh_imu_model_ui()
@@ -850,6 +854,8 @@ class BMI160CalibrationApp:
         self.disconnect_btn.config(state="normal")
         self._set_imu_model_controls_enabled(False)
         self._calibration_mode_on = False
+        self._bno_initialized = False
+        self._stream_watch_deadline = None
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
         self._stream_scale = StreamScale()
@@ -873,6 +879,15 @@ class BMI160CalibrationApp:
         else:
             self.status_var.set(f"Connected to {port} — streaming DFRobot CSV.")
 
+    def _on_serial_reader_stopped(self) -> None:
+        def notify() -> None:
+            if not self.client.is_connected:
+                return
+            self.status_var.set(
+                "Serial reader stopped — close Arduino Serial Monitor, Disconnect, then Connect again."
+            )
+        self.root.after(0, notify)
+
     def _disconnect(self) -> None:
         self.capture.cancel()
         self.client.disconnect()
@@ -881,12 +896,37 @@ class BMI160CalibrationApp:
         self.disconnect_btn.config(state="disabled")
         self._set_imu_model_controls_enabled(True)
         self._calibration_mode_on = False
+        self._bno_initialized = False
+        self._stream_watch_deadline = None
         self._refresh_calibration_mode_button()
         self._apply_mode_button_states()
         self.imu_visualizer.set_running(False)
         self.imu_visualizer.clear_level()
         self._set_capture_ui(active=False)
         self.status_var.set("Disconnected.")
+
+    def _arm_stream_watchdog(self) -> None:
+        self._stream_watch_samples = self.client.total_samples
+        self._stream_watch_deadline = time.time() + 4.0
+
+    def _check_stream_watchdog(self) -> None:
+        if self._stream_watch_deadline is None or not self.client.is_connected:
+            return
+        if time.time() < self._stream_watch_deadline:
+            return
+        self._stream_watch_deadline = None
+        if self.client.total_samples <= self._stream_watch_samples:
+            if self._is_bno055_mode():
+                hint = (
+                    "No samples received. For BNO055: select BNO055 model, Connect, "
+                    "click Turn ON Calibration Mode (auto-initializes), or use Initialize / NDOF first."
+                )
+            else:
+                hint = (
+                    "No samples received. For BMI160: Turn ON Calibration Mode. "
+                    "Close Arduino Serial Monitor first — only one app can use the COM port."
+                )
+            self.status_var.set(hint)
 
     def _on_close(self) -> None:
         self.capture.cancel()
@@ -1021,6 +1061,7 @@ class BMI160CalibrationApp:
             if self._plot_sample_counter % 30 == 0:
                 self._update_mag_ui_visibility()
 
+        self._check_stream_watchdog()
         self.root.after(250, self._update_display_loop)
 
     def _set_capture_ui(self, active: bool) -> None:
@@ -1075,21 +1116,48 @@ class BMI160CalibrationApp:
         if not self._ensure_connected():
             return
 
-        self._calibration_mode_on = not self._calibration_mode_on
-        command = "CAL_MODE_ON" if self._calibration_mode_on else "CAL_MODE_OFF"
-        status = (
-            "Arduino calibration mode command sent. IMU data should stream now."
-            if self._calibration_mode_on
-            else "Arduino calibration mode OFF command sent. IMU streaming should stop."
-        )
+        turning_on = not self._calibration_mode_on
+        self._calibration_mode_on = turning_on
+        command = "CAL_MODE_ON" if turning_on else "CAL_MODE_OFF"
         self._refresh_calibration_mode_button()
-        self.status_var.set(status)
+        if turning_on:
+            self._arm_stream_watchdog()
+            self.status_var.set("Enabling IMU stream…")
+        else:
+            self._stream_watch_deadline = None
+            self.status_var.set("Arduino calibration mode OFF command sent. IMU streaming should stop.")
 
         def worker() -> None:
             try:
+                if turning_on and self._is_bno055_mode():
+                    response = self.client.send_command("BNO_BEGIN", timeout=5.0)
+                    kind, payload = parse_cal_response(response or "")
+                    if kind == "BNO_BEGIN" and payload:
+                        self._bno_initialized = True
+                    else:
+                        msg = "BNO_BEGIN failed"
+                        if payload and payload.get("message"):
+                            msg = str(payload["message"])
+                        self._calibration_mode_on = False
+                        self.root.after(0, self._refresh_calibration_mode_button)
+                        self.root.after(0, lambda: self.status_var.set(f"No stream: {msg}"))
+                        self._stream_watch_deadline = None
+                        return
                 self.client.write_command(command)
+                if turning_on:
+                    self.root.after(
+                        0,
+                        lambda: self.status_var.set(
+                            "Calibration mode ON — IMU data should stream now."
+                            if not self._is_bno055_mode()
+                            else "BNO055 initialized and streaming — data should appear now."
+                        ),
+                    )
             except RuntimeError as exc:
+                self._calibration_mode_on = False
+                self.root.after(0, self._refresh_calibration_mode_button)
                 self.root.after(0, lambda: self.status_var.set(f"Calibration mode command failed: {exc}"))
+                self._stream_watch_deadline = None
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1112,6 +1180,7 @@ class BMI160CalibrationApp:
         kind, payload = parse_cal_response(response or "")
         if kind == "BNO_BEGIN" and payload:
             address = payload.get("address", 0)
+            self._bno_initialized = True
             self.status_var.set(f"BNO055 initialized at 0x{int(address):02X} in NDOF mode.")
             messagebox.showinfo(
                 "BNO055 Ready",
